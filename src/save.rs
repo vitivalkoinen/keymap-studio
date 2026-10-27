@@ -11,9 +11,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-#[cfg(any(windows, test))]
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::{self, Config};
 
@@ -88,22 +86,46 @@ pub fn save(
     opts: &Options,
 ) -> Result<Vec<u8>, SaveError> {
     let text = config::to_json(cfg).map_err(SaveError::Write)?;
+    write_locked(path, text.as_bytes(), Some(snapshot), opts)?;
+    Ok(text.into_bytes())
+}
+
+/// `path` を `contents` でそのまま置き換える(導入前の設定に戻す操作。SPEC.md §4.7)。
+///
+/// 手順は [`save`] と同じだが、外部の変更は検知しない(ユーザーが明示的に戻すと決めた操作のため)。
+/// 今のファイルがあれば、その内容を世代バックアップに残してから置き換える。今のファイルが
+/// なければバックアップせずに作る。
+pub fn overwrite(path: &Path, contents: &[u8], opts: &Options) -> Result<(), SaveError> {
+    write_locked(path, contents, None, opts)
+}
+
+/// ロックを取り、今のファイルを世代バックアップに残してから `contents` で置き換える。
+///
+/// `snapshot` があれば、今のファイルの内容がそれと違う(削除も含む)ときに中止する。
+fn write_locked(
+    path: &Path,
+    contents: &[u8],
+    snapshot: Option<&[u8]>,
+    opts: &Options,
+) -> Result<(), SaveError> {
     let dir = path.parent().unwrap_or(Path::new(""));
     let _lock = lock(&dir.join(LOCK_FILE))?;
 
     let current = match fs::read(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(SaveError::Modified),
+        Ok(c) => Some(c),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(SaveError::Read(format!("{}: {e}", path.display()))),
     };
-    if current != snapshot {
+    if let Some(snapshot) = snapshot
+        && current.as_deref() != Some(snapshot)
+    {
         return Err(SaveError::Modified);
     }
 
-    backup(path, &current, opts, SystemTime::now()).map_err(SaveError::Backup)?;
-    write_replace(path, text.as_bytes())
-        .map_err(|e| SaveError::Write(format!("{}: {e}", path.display())))?;
-    Ok(text.into_bytes())
+    if let Some(current) = &current {
+        backup(path, current, opts, SystemTime::now()).map_err(SaveError::Backup)?;
+    }
+    write_replace(path, contents).map_err(|e| SaveError::Write(format!("{}: {e}", path.display())))
 }
 
 /// 書き込みの間 `editorTransaction.lock` を開いたままにしておくための値。
@@ -145,13 +167,23 @@ fn lock(_path: &Path) -> Result<LockGuard, SaveError> {
 fn retry<T>(
     timeout: Duration,
     interval: Duration,
+    f: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    retry_unless(timeout, interval, f, |_| false)
+}
+
+/// [`retry`] と同じだが、`give_up` が `true` を返すエラーでは呼び直さずにすぐ返す。
+pub fn retry_unless<T>(
+    timeout: Duration,
+    interval: Duration,
     mut f: impl FnMut() -> io::Result<T>,
+    give_up: impl Fn(&io::Error) -> bool,
 ) -> io::Result<T> {
     let start = std::time::Instant::now();
     loop {
         match f() {
             Ok(v) => return Ok(v),
-            Err(e) if start.elapsed() >= timeout => return Err(e),
+            Err(e) if give_up(&e) || start.elapsed() >= timeout => return Err(e),
             Err(_) => std::thread::sleep(interval),
         }
     }
@@ -275,16 +307,30 @@ fn parse_backup_name(name: &str, stem: &str) -> Option<(String, u32)> {
 
 /// UTC の日時を `YYYYMMDDTHHMMSS.mmmZ` の形にする。
 fn timestamp(t: SystemTime) -> String {
+    let (y, m, day, h, min, sec, ms) = utc_parts(t);
+    format!("{y:04}{m:02}{day:02}T{h:02}{min:02}{sec:02}.{ms:03}Z")
+}
+
+/// UTC の日時を ISO 8601 の拡張形式 `YYYY-MM-DDTHH:MM:SS.mmmZ` にする(記録や表示用)。
+pub fn iso8601(t: SystemTime) -> String {
+    let (y, m, day, h, min, sec, ms) = utc_parts(t);
+    format!("{y:04}-{m:02}-{day:02}T{h:02}:{min:02}:{sec:02}.{ms:03}Z")
+}
+
+/// UTC の (年, 月, 日, 時, 分, 秒, ミリ秒)。
+fn utc_parts(t: SystemTime) -> (i64, u32, u32, u64, u64, u64, u32) {
     let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = d.as_secs();
     let (days, sod) = ((secs / 86_400) as i64, secs % 86_400);
     let (y, m, day) = civil_from_days(days);
-    format!(
-        "{y:04}{m:02}{day:02}T{:02}{:02}{:02}.{:03}Z",
+    (
+        y,
+        m,
+        day,
         sod / 3600,
         sod % 3600 / 60,
         sod % 60,
-        d.subsec_millis()
+        d.subsec_millis(),
     )
 }
 
@@ -570,6 +616,39 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_ignores_snapshot_and_backs_up_current() {
+        let (_tmp, path, opts) = setup();
+        // 読み込んだあとに外部で変更されていても、今の内容をバックアップして置き換える
+        let external = SAMPLE.replace("\"100\"", "\"101\"");
+        fs::write(&path, &external).unwrap();
+        overwrite(&path, b"{}", &opts).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"{}");
+        let backups = files_in(&opts.backup_dir);
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            fs::read_to_string(opts.backup_dir.join(&backups[0])).unwrap(),
+            external
+        );
+        let names = files_in(path.parent().unwrap());
+        assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
+    }
+
+    #[test]
+    fn overwrite_creates_missing_file_without_backup() {
+        let (_tmp, path, opts) = setup();
+        fs::remove_file(&path).unwrap();
+        overwrite(&path, b"{}", &opts).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"{}");
+        assert!(!opts.backup_dir.exists());
+    }
+
+    #[test]
+    fn iso8601_is_utc() {
+        let t = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+        assert_eq!(iso8601(t), "2023-11-14T22:13:20.123Z");
+    }
+
+    #[test]
     fn timestamp_is_utc() {
         assert_eq!(timestamp(UNIX_EPOCH), "19700101T000000.000Z");
         let t = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
@@ -614,6 +693,24 @@ mod tests {
             }
         });
         assert_eq!(r.unwrap(), 3);
+    }
+
+    #[test]
+    fn retry_unless_gives_up_immediately() {
+        let mut calls = 0;
+        let start = std::time::Instant::now();
+        let r: io::Result<()> = retry_unless(
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            || {
+                calls += 1;
+                Err(io::Error::other("fatal"))
+            },
+            |_| true,
+        );
+        assert!(r.is_err());
+        assert_eq!(calls, 1);
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

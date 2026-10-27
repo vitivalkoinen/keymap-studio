@@ -58,6 +58,29 @@ pub enum Msg {
     Cancel,
     SignalEventNotFound,
     SettingsLoadFailed,
+    InitialBackupCreated,
+    InitialBackupFailed,
+    DataDirNotFound,
+    RestoreButton,
+    RestoreUnavailableArgument,
+    RestoreUnavailableNoBackup,
+    RestoreUnavailableNoPath,
+    RestoreUnavailableOtherConfiguration,
+    RestoreConfirm,
+    RestoreDefinitionFile,
+    RestoreBackedUpAt,
+    RestoreNoDefinition,
+    RestoreDiscardsUnsaved,
+    Restore,
+    Restored,
+    RestoredNotApplied,
+    RestoredReloadFailed,
+    RestoreBackupUnreadable,
+    RestoreAbortedLocked,
+    RestoreFailedBackup,
+    RestoreFailed,
+    InitialBackupSkippedByArgument,
+    SaveBlockedByInitialBackup,
 }
 
 impl Msg {
@@ -108,6 +131,29 @@ impl Msg {
         Msg::Cancel,
         Msg::SignalEventNotFound,
         Msg::SettingsLoadFailed,
+        Msg::InitialBackupCreated,
+        Msg::InitialBackupFailed,
+        Msg::DataDirNotFound,
+        Msg::RestoreButton,
+        Msg::RestoreUnavailableArgument,
+        Msg::RestoreUnavailableNoBackup,
+        Msg::RestoreUnavailableNoPath,
+        Msg::RestoreUnavailableOtherConfiguration,
+        Msg::RestoreConfirm,
+        Msg::RestoreDefinitionFile,
+        Msg::RestoreBackedUpAt,
+        Msg::RestoreNoDefinition,
+        Msg::RestoreDiscardsUnsaved,
+        Msg::Restore,
+        Msg::Restored,
+        Msg::RestoredNotApplied,
+        Msg::RestoredReloadFailed,
+        Msg::RestoreBackupUnreadable,
+        Msg::RestoreAbortedLocked,
+        Msg::RestoreFailedBackup,
+        Msg::RestoreFailed,
+        Msg::InitialBackupSkippedByArgument,
+        Msg::SaveBlockedByInitialBackup,
     ];
 }
 
@@ -172,6 +218,55 @@ fn en(msg: Msg) -> &'static str {
         Msg::Cancel => "Cancel",
         Msg::SignalEventNotFound => "PowerToys Keyboard Manager does not seem to be running",
         Msg::SettingsLoadFailed => "Not loaded: failed to read settings.json",
+        Msg::InitialBackupCreated => {
+            "Backed up the PowerToys Keyboard Manager settings (first launch)"
+        }
+        Msg::InitialBackupFailed => {
+            "Failed to back up the PowerToys Keyboard Manager settings at first launch (will try again at next launch)"
+        }
+        Msg::DataDirNotFound => "the data folder (next to the executable) could not be determined",
+        Msg::RestoreButton => "Restore settings from before installation…",
+        Msg::RestoreUnavailableArgument => {
+            "Not available when a file is specified on the command line."
+        }
+        Msg::RestoreUnavailableNoBackup => {
+            "Not available: there is no backup from the first launch."
+        }
+        Msg::RestoreUnavailableNoPath => {
+            "Not available: the config file path could not be determined."
+        }
+        Msg::RestoreUnavailableOtherConfiguration => {
+            "Not available: the active configuration is different from the one backed up at the first launch"
+        }
+        Msg::RestoreConfirm => {
+            "The remap definition will be restored to the state backed up at the first launch of Keymap Studio. The current remaps will be lost (a copy of the current file is kept in the backups folder). settings.json and editorSettings.json are not changed."
+        }
+        Msg::RestoreDefinitionFile => "Remap definition file",
+        Msg::RestoreBackedUpAt => "Backed up at",
+        Msg::RestoreNoDefinition => {
+            "The remap definition file did not exist at that time, so an empty definition (no remaps) will be written."
+        }
+        Msg::RestoreDiscardsUnsaved => "Your unsaved changes will also be discarded.",
+        Msg::Restore => "Restore",
+        Msg::Restored => "Restored the remap definition from before installation.",
+        Msg::RestoredNotApplied => {
+            "Restored, but PowerToys may not have applied the changes (turn Keyboard Manager off and on in PowerToys to apply them)"
+        }
+        Msg::RestoredReloadFailed => "Restored, but failed to reload the file",
+        Msg::RestoreBackupUnreadable => {
+            "Not restored: failed to read the backup from the first launch"
+        }
+        Msg::RestoreAbortedLocked => {
+            "Not restored: the file is locked by another program (timed out)"
+        }
+        Msg::RestoreFailedBackup => "Not restored: failed to create a backup of the current file",
+        Msg::RestoreFailed => "Failed to restore",
+        Msg::InitialBackupSkippedByArgument => {
+            "A file was specified on the command line, so the backup of the settings from before installation is neither created nor restored."
+        }
+        Msg::SaveBlockedByInitialBackup => {
+            "Saving is disabled until the backup of the settings from before installation has been created (it will be tried again at next launch)."
+        }
     }
 }
 

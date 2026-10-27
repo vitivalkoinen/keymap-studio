@@ -3,13 +3,17 @@
 mod config;
 mod edit;
 mod i18n;
+mod initial_backup;
 mod keycap;
 mod keys;
 mod layout;
 mod matching;
 mod save;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use config::{Config, KeyCode, PathError, Remap};
 use eframe::egui;
@@ -20,7 +24,15 @@ use matching::{KeyRemapLabel, KeyState, Role, SourceMap};
 fn main() -> eframe::Result {
     // 引数でパスを指定できる(WSL での開発時は /mnt/c/... を渡す)。
     // 指定がなければ settings.json の activeConfiguration から決める。読み込みと保存は同じファイル。
-    let path = config::resolve_path(std::env::args_os().nth(1).map(PathBuf::from));
+    let arg = std::env::args_os().nth(1).map(PathBuf::from);
+    // 導入前の設定のバックアップ(§4.7)は PowerToys の実際の設定フォルダだけを対象にする。
+    // 引数で指定したファイルは開発・テスト用なので、バックアップも復元もしない。
+    let initial = if arg.is_some() {
+        InitialBackup::SkippedByArgument
+    } else {
+        InitialBackup::ensure()
+    };
+    let path = config::resolve_path(arg);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 600.0]),
@@ -29,7 +41,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Keymap Studio",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new(path)))),
+        Box::new(|_cc| Ok(Box::new(App::new(path, initial)))),
     )
 }
 
@@ -66,6 +78,86 @@ impl From<PathError> for LoadError {
             PathError::DirNotFound => LoadError::PathNotFound,
             PathError::SettingsUnreadable(detail) => LoadError::SettingsUnreadable(detail),
             PathError::UnsafeConfiguration(value) => LoadError::UnsafeConfiguration(value),
+        }
+    }
+}
+
+/// 導入前の設定のバックアップ(§4.7)の状態。
+enum InitialBackup {
+    /// 引数でファイルを指定して起動したので扱わない
+    SkippedByArgument,
+    /// データフォルダ(exe と同じフォルダ)が分からない
+    DataDirNotFound,
+    /// Keyboard Manager の設定フォルダが分からない
+    SourceDirNotFound,
+    /// 作れなかった、または前に作ったものを読めなかった(詳細はそのまま表示する)。
+    /// 次の起動で再び試す
+    Failed(String),
+    Ready {
+        /// バックアップのフォルダ
+        dir: PathBuf,
+        manifest: initial_backup::Manifest,
+        /// 今回の起動で作った
+        created: bool,
+    },
+}
+
+impl InitialBackup {
+    /// バックアップがなければ作る。すでにあれば読む。
+    fn ensure() -> Self {
+        let Some(dir) = initial_backup::default_dir() else {
+            return InitialBackup::DataDirNotFound;
+        };
+        let Some(source) = config::powertoys_dir() else {
+            return InitialBackup::SourceDirNotFound;
+        };
+        match initial_backup::ensure(&dir, &source, std::time::SystemTime::now()) {
+            Ok(outcome) => {
+                let created = matches!(outcome, initial_backup::Outcome::Created(_));
+                InitialBackup::Ready {
+                    dir,
+                    manifest: outcome.manifest().clone(),
+                    created,
+                }
+            }
+            Err(e) => InitialBackup::Failed(e),
+        }
+    }
+
+    /// 保存を止めるか。初回のバックアップができていない間は、導入前の状態を確実に残すため
+    /// 保存しない(§4.7)。引数でファイルを指定して起動したときはバックアップを扱わないので止めない。
+    fn blocks_save(&self) -> bool {
+        match self {
+            InitialBackup::SkippedByArgument | InitialBackup::Ready { .. } => false,
+            InitialBackup::DataDirNotFound
+            | InitialBackup::SourceDirNotFound
+            | InitialBackup::Failed(_) => true,
+        }
+    }
+
+    /// 起動時に知らせること(エラーか、今回作ったこと、扱わないこと)。知らせることがなければ `None`。
+    fn notice(&self, lang: Lang) -> Option<(bool, String)> {
+        let failed = |detail: &str| {
+            Some((
+                true,
+                format!("{}: {detail}", tr(lang, Msg::InitialBackupFailed)),
+            ))
+        };
+        match self {
+            InitialBackup::SkippedByArgument => Some((
+                false,
+                tr(lang, Msg::InitialBackupSkippedByArgument).to_owned(),
+            )),
+            InitialBackup::DataDirNotFound => failed(tr(lang, Msg::DataDirNotFound)),
+            InitialBackup::SourceDirNotFound => failed(tr(lang, Msg::ConfigPathNotFound)),
+            InitialBackup::Failed(d) => failed(d),
+            InitialBackup::Ready {
+                dir, created: true, ..
+            } => Some((
+                false,
+                format!("{}: {}", tr(lang, Msg::InitialBackupCreated), dir.display()),
+            )),
+            InitialBackup::Ready { created: false, .. } => None,
         }
     }
 }
@@ -127,11 +219,23 @@ enum Status {
     Reloaded,
     /// 読み直しに失敗した(編集中の内容はそのまま)
     ReloadFailed(String),
+    /// 導入前の設定に戻した
+    Restored,
+    /// 戻したが、エンジンへの通知に失敗した
+    RestoredNotApplied(save::SignalError),
+    /// 戻したが、読み直しに失敗した(詳細はそのまま表示する)。エンジンへの通知の結果も持つ
+    RestoredReloadFailed(String, Result<(), save::SignalError>),
+    /// 初回のバックアップができていないため保存しなかった
+    SaveBlockedByInitialBackup,
+    /// 導入時のバックアップから戻す内容を読めなかった(詳細はそのまま表示する)
+    RestoreBackupUnreadable(String),
+    /// 書き戻しに失敗した
+    RestoreFailed(save::SaveError),
 }
 
 impl Status {
     fn is_error(&self) -> bool {
-        !matches!(self, Status::Saved | Status::Reloaded)
+        !matches!(self, Status::Saved | Status::Reloaded | Status::Restored)
     }
 
     /// 外部の変更を検知して保存を中止したか(読み直しの操作を出す)。
@@ -161,6 +265,27 @@ impl Status {
             Status::BackupDirNotFound => tr(lang, Msg::BackupDirNotFound).to_owned(),
             Status::Reloaded => tr(lang, Msg::Reloaded).to_owned(),
             Status::ReloadFailed(d) => with(Msg::ReloadFailed, d),
+            Status::Restored => tr(lang, Msg::Restored).to_owned(),
+            Status::RestoredNotApplied(e) => with(Msg::RestoredNotApplied, &signal_detail(lang, e)),
+            Status::RestoredReloadFailed(d, signal) => {
+                let mut text = with(Msg::RestoredReloadFailed, d);
+                if let Err(e) = signal {
+                    text.push_str(" / ");
+                    text.push_str(&with(Msg::RestoredNotApplied, &signal_detail(lang, e)));
+                }
+                text
+            }
+            Status::SaveBlockedByInitialBackup => {
+                tr(lang, Msg::SaveBlockedByInitialBackup).to_owned()
+            }
+            Status::RestoreBackupUnreadable(d) => with(Msg::RestoreBackupUnreadable, d),
+            Status::RestoreFailed(SaveError::LockTimeout(d)) => with(Msg::RestoreAbortedLocked, d),
+            Status::RestoreFailed(SaveError::Backup(d)) => with(Msg::RestoreFailedBackup, d),
+            Status::RestoreFailed(SaveError::Read(d) | SaveError::Write(d)) => {
+                with(Msg::RestoreFailed, d)
+            }
+            // 書き戻しでは外部の変更を検知しないので起こらない
+            Status::RestoreFailed(SaveError::Modified) => tr(lang, Msg::RestoreFailed).to_owned(),
         }
     }
 }
@@ -172,6 +297,8 @@ enum Dialog {
     CloseWithUnsaved,
     /// 未保存の変更を破棄してファイルを読み直すか
     DiscardAndReload,
+    /// 導入前の設定に戻すか
+    Restore,
 }
 
 /// 確認ダイアログで選ばれた操作。
@@ -193,6 +320,8 @@ struct App {
     choices: Vec<KeyCode>,
     /// 世代バックアップを置くフォルダ(exe と同じフォルダの `backups`)
     backup_dir: Option<PathBuf>,
+    /// 導入前の設定のバックアップ
+    initial: InitialBackup,
     status: Option<Status>,
     dialog: Option<Dialog>,
     /// 未保存の変更があっても閉じてよい(確認ダイアログで保存または破棄を選んだ)
@@ -200,7 +329,7 @@ struct App {
 }
 
 impl App {
-    fn new(path: Result<PathBuf, PathError>) -> Self {
+    fn new(path: Result<PathBuf, PathError>, initial: InitialBackup) -> Self {
         let (path, doc) = match path {
             Ok(p) => {
                 let doc = Document::load(&p).map_err(LoadError::Failed);
@@ -216,6 +345,7 @@ impl App {
             selected: None,
             choices: keys::target_choices(),
             backup_dir: save::default_backup_dir(),
+            initial,
             status: None,
             dialog: None,
             allow_close: false,
@@ -231,6 +361,10 @@ impl App {
         let (Some(path), Ok(doc)) = (&self.path, &mut self.doc) else {
             return;
         };
+        if self.initial.blocks_save() {
+            self.status = Some(Status::SaveBlockedByInitialBackup);
+            return;
+        }
         let Some(backup_dir) = &self.backup_dir else {
             self.status = Some(Status::BackupDirNotFound);
             return;
@@ -263,6 +397,91 @@ impl App {
         });
     }
 
+    /// 導入前の設定に戻せるか。戻せなければ理由を返す。
+    fn restore_unavailable(&self, lang: Lang) -> Option<String> {
+        let manifest = match &self.initial {
+            InitialBackup::SkippedByArgument => {
+                return Some(tr(lang, Msg::RestoreUnavailableArgument).to_owned());
+            }
+            InitialBackup::Ready { manifest, .. } => manifest,
+            _ => return Some(tr(lang, Msg::RestoreUnavailableNoBackup).to_owned()),
+        };
+        if self.backup_dir.is_none() {
+            return Some(tr(lang, Msg::BackupDirNotFound).to_owned());
+        }
+        let Some(path) = &self.path else {
+            return Some(tr(lang, Msg::RestoreUnavailableNoPath).to_owned());
+        };
+        // 今の activeConfiguration がバックアップを取ったときと違えば、どちらへ戻すべきか
+        // 決まっていないので戻さない
+        if !is_definition_file(path, &manifest.definition.name) {
+            return Some(format!(
+                "{}: {}",
+                tr(lang, Msg::RestoreUnavailableOtherConfiguration),
+                manifest.definition.name
+            ));
+        }
+        None
+    }
+
+    /// 導入時のバックアップの定義ファイルを、§4.8 の保存処理で書き戻して読み直す。
+    ///
+    /// 外部の変更は検知しない(今のファイルの内容を世代バックアップに残して置き換える)。
+    /// 編集中の内容は破棄する。
+    fn restore(&mut self) {
+        let (Some(path), Some(backup_dir), InitialBackup::Ready { dir, manifest, .. }) =
+            (&self.path, &self.backup_dir, &self.initial)
+        else {
+            return;
+        };
+        let contents = match initial_backup::definition_contents(dir, manifest) {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = Some(Status::RestoreBackupUnreadable(e));
+                return;
+            }
+        };
+        let opts = save::Options::new(backup_dir.clone());
+        if let Err(e) = save::overwrite(path, &contents, &opts) {
+            self.status = Some(Status::RestoreFailed(e));
+            return;
+        }
+        let signal = save::signal_settings_changed();
+        self.status = Some(match Document::load(path) {
+            Ok(doc) => {
+                self.doc = Ok(doc);
+                match signal {
+                    Ok(()) => Status::Restored,
+                    Err(e) => Status::RestoredNotApplied(e),
+                }
+            }
+            Err(e) => Status::RestoredReloadFailed(e, signal),
+        });
+    }
+
+    /// 戻す前の確認の文。何が起こるかと、未保存の変更が破棄されることを含める。
+    fn restore_confirm_text(&self, lang: Lang) -> String {
+        let mut text = tr(lang, Msg::RestoreConfirm).to_owned();
+        if let InitialBackup::Ready { manifest, .. } = &self.initial {
+            text.push_str(&format!(
+                "\n\n{}: {}\n{}: {}",
+                tr(lang, Msg::RestoreDefinitionFile),
+                manifest.definition.name,
+                tr(lang, Msg::RestoreBackedUpAt),
+                manifest.created_at
+            ));
+            if !manifest.definition.existed {
+                text.push_str("\n\n");
+                text.push_str(tr(lang, Msg::RestoreNoDefinition));
+            }
+        }
+        if self.is_dirty() {
+            text.push_str("\n\n");
+            text.push_str(tr(lang, Msg::RestoreDiscardsUnsaved));
+        }
+        text
+    }
+
     /// 確認ダイアログを表示し、選ばれた操作を実行する。
     fn show_dialog(&mut self, ctx: &egui::Context) {
         let Some(dialog) = self.dialog else {
@@ -270,12 +489,16 @@ impl App {
         };
         let lang = self.lang;
         let (text, discard) = match dialog {
-            Dialog::CloseWithUnsaved => (Msg::CloseConfirm, Msg::DontSave),
-            Dialog::DiscardAndReload => (Msg::ReloadConfirm, Msg::DiscardAndReload),
+            Dialog::CloseWithUnsaved => (tr(lang, Msg::CloseConfirm).to_owned(), Msg::DontSave),
+            Dialog::DiscardAndReload => (
+                tr(lang, Msg::ReloadConfirm).to_owned(),
+                Msg::DiscardAndReload,
+            ),
+            Dialog::Restore => (self.restore_confirm_text(lang), Msg::Restore),
         };
         let mut choice = None;
         let response = egui::Modal::new(egui::Id::unique("confirm_dialog")).show(ctx, |ui| {
-            ui.label(tr(lang, text));
+            ui.label(text);
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if dialog == Dialog::CloseWithUnsaved && ui.button(tr(lang, Msg::Save)).clicked() {
@@ -312,7 +535,8 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             (Dialog::DiscardAndReload, DialogChoice::Discard) => self.reload(),
-            (Dialog::DiscardAndReload, DialogChoice::Save) => {}
+            (Dialog::DiscardAndReload | Dialog::Restore, DialogChoice::Save) => {}
+            (Dialog::Restore, DialogChoice::Discard) => self.restore(),
         }
     }
 }
@@ -336,13 +560,27 @@ impl eframe::App for App {
             if let Some(p) = &self.path {
                 ui.label(p.display().to_string());
             }
+            if let Some((is_error, notice)) = self.initial.notice(lang) {
+                if is_error {
+                    ui.colored_label(ui.visuals().error_fg_color, notice);
+                } else {
+                    ui.label(notice);
+                }
+            }
             if let Ok(doc) = &self.doc {
                 let dirty = doc.is_dirty();
+                let blocked = self.initial.blocks_save();
                 let mut clicked = false;
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     clicked = ui
-                        .add_enabled(dirty, save_button(ui, lang, dirty))
+                        .add_enabled(dirty && !blocked, save_button(ui, lang, dirty))
                         .clicked();
+                    if blocked {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            tr(lang, Msg::SaveBlockedByInitialBackup),
+                        );
+                    }
                     if dirty {
                         ui.colored_label(ui.visuals().warn_fg_color, tr(lang, Msg::UnsavedChanges));
                     } else {
@@ -352,6 +590,22 @@ impl eframe::App for App {
                 if clicked {
                     self.save();
                 }
+            }
+            let unavailable = self.restore_unavailable(lang);
+            let mut restore = false;
+            ui.horizontal_wrapped(|ui| {
+                restore = ui
+                    .add_enabled(
+                        unavailable.is_none(),
+                        egui::Button::new(tr(lang, Msg::RestoreButton)),
+                    )
+                    .clicked();
+                if let Some(reason) = &unavailable {
+                    ui.weak(reason);
+                }
+            });
+            if restore {
+                self.dialog = Some(Dialog::Restore);
             }
             if let Some(status) = &self.status {
                 let color = if status.is_error() {
@@ -712,9 +966,92 @@ fn key_details(
     action
 }
 
+/// エンジンへの通知に失敗した理由の表示。
+fn signal_detail(lang: Lang, e: &save::SignalError) -> String {
+    match e {
+        save::SignalError::Unsupported => tr(lang, Msg::SignalUnsupported).to_owned(),
+        save::SignalError::EventNotFound => tr(lang, Msg::SignalEventNotFound).to_owned(),
+        save::SignalError::Os(d) => d.clone(),
+    }
+}
+
+/// `path` のファイル名が `name` か。
+fn is_definition_file(path: &Path, name: &str) -> bool {
+    path.file_name().is_some_and(|n| n == name)
+}
+
 fn format_keys(keys: &[KeyCode]) -> String {
     keys.iter()
         .map(|&k| keys::name(k))
         .collect::<Vec<_>>()
         .join(" + ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_is_blocked_only_while_initial_backup_is_missing() {
+        assert!(!InitialBackup::SkippedByArgument.blocks_save());
+        assert!(InitialBackup::DataDirNotFound.blocks_save());
+        assert!(InitialBackup::SourceDirNotFound.blocks_save());
+        assert!(InitialBackup::Failed("x".into()).blocks_save());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let km = tmp.path().join("Keyboard Manager");
+        std::fs::create_dir(&km).unwrap();
+        let dir = tmp.path().join(initial_backup::DIR_NAME);
+        let outcome = initial_backup::ensure(&dir, &km, std::time::SystemTime::now()).unwrap();
+        let ready = InitialBackup::Ready {
+            dir,
+            manifest: outcome.manifest().clone(),
+            created: true,
+        };
+        assert!(!ready.blocks_save());
+    }
+
+    #[test]
+    fn save_is_refused_while_initial_backup_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("default.json");
+        let original = r#"{"remapKeys":{"inProcess":[]}}"#;
+        std::fs::write(&path, original).unwrap();
+        let mut app = App::new(Ok(path.clone()), InitialBackup::Failed("x".into()));
+        app.backup_dir = Some(tmp.path().join("backups"));
+        let doc = app.doc.as_mut().ok().unwrap();
+        edit::set(
+            &mut doc.config.remap_keys.in_process,
+            KeyCode(0x41),
+            KeyCode(0x42),
+        );
+        assert!(app.is_dirty());
+
+        app.save();
+        assert!(matches!(
+            app.status,
+            Some(Status::SaveBlockedByInitialBackup)
+        ));
+        assert!(app.is_dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!tmp.path().join("backups").exists());
+    }
+
+    #[test]
+    fn argument_mode_shows_notice_and_disables_restore() {
+        let lang = Lang::En;
+        let notice = InitialBackup::SkippedByArgument.notice(lang);
+        assert_eq!(
+            notice,
+            Some((
+                false,
+                tr(lang, Msg::InitialBackupSkippedByArgument).to_owned()
+            ))
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("default.json");
+        std::fs::write(&path, "{}").unwrap();
+        let app = App::new(Ok(path), InitialBackup::SkippedByArgument);
+        assert!(app.restore_unavailable(lang).is_some());
+    }
 }
