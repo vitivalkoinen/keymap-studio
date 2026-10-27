@@ -351,7 +351,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// エンジンへの通知に失敗した理由。
 #[derive(Debug)]
 pub enum SignalError {
-    /// Windows 以外では通知できない
+    /// Windows 以外では通知できない(Windows でもテストでは通知しない)
     #[cfg_attr(windows, allow(dead_code))]
     Unsupported,
     /// イベントがない(PowerToys の Keyboard Manager が動いていない、など)。
@@ -375,6 +375,11 @@ pub enum SignalError {
 pub fn signal_settings_changed() -> Result<(), SignalError> {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND};
     use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+
+    // テストでは実際に動いている PowerToys に通知しない
+    if cfg!(test) {
+        return Err(SignalError::Unsupported);
+    }
 
     let name: Vec<u16> = SETTINGS_EVENT_NAME
         .encode_utf16()

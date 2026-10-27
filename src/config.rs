@@ -103,35 +103,56 @@ impl KeyCode {
 /// `settings.json` の `activeConfiguration` がないときの構成名。
 pub const DEFAULT_CONFIGURATION: &str = "default";
 
-/// Windows 上の Keyboard Manager の設定フォルダ。
-pub fn powertoys_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| {
-        d.join("Microsoft")
-            .join("PowerToys")
-            .join("Keyboard Manager")
-    })
+/// PowerToys の設定フォルダの中の Keyboard Manager のフォルダ名。
+pub const KEYBOARD_MANAGER_DIR: &str = "Keyboard Manager";
+
+/// Windows 上の PowerToys の設定フォルダ(`%LOCALAPPDATA%\Microsoft\PowerToys`)。
+pub fn powertoys_root() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("Microsoft").join("PowerToys"))
+}
+
+/// PowerToys の状態(SPEC.md §1.1)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PowerToysState {
+    /// PowerToys が入っていない(PowerToys の設定フォルダがない)
+    NotInstalled,
+    /// PowerToys は入っているが、Keyboard Manager のフォルダかリマップの定義ファイルがない
+    NotConfigured,
+    /// 通常
+    Ready {
+        /// Keyboard Manager の設定フォルダ
+        dir: PathBuf,
+        /// リマップの定義ファイル(`activeConfiguration` のもの)
+        definition: PathBuf,
+    },
+}
+
+/// `root`(PowerToys の設定フォルダ)を見て、PowerToys の状態を判定する。ファイルは作らない。
+///
+/// 定義ファイルは [`active_config_path`] で決める(`settings.json` がなければ `default.json`)。
+/// `settings.json` があるのに読めない、値が安全でないときはそのエラーを返す。
+pub fn detect(root: &Path) -> Result<PowerToysState, PathError> {
+    if !root.is_dir() {
+        return Ok(PowerToysState::NotInstalled);
+    }
+    let dir = root.join(KEYBOARD_MANAGER_DIR);
+    if !dir.is_dir() {
+        return Ok(PowerToysState::NotConfigured);
+    }
+    let definition = active_config_path(&dir)?;
+    if !definition.is_file() {
+        return Ok(PowerToysState::NotConfigured);
+    }
+    Ok(PowerToysState::Ready { dir, definition })
 }
 
 /// 読み書きする設定ファイルのパスを決められなかった理由。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathError {
-    /// 設定フォルダ(`%LOCALAPPDATA%`)が分からない
-    DirNotFound,
     /// `settings.json` があるのに読めない、または JSON として解析できない(詳細はそのまま表示する)
     SettingsUnreadable(String),
     /// `settings.json` の `activeConfiguration` がファイル名として安全でない(値をそのまま持つ)
     UnsafeConfiguration(String),
-}
-
-/// 読み書きする設定ファイルのパス。
-///
-/// `arg`(コマンドライン引数)があればそれを使う。なければ設定フォルダの
-/// [`active_config_path`]。
-pub fn resolve_path(arg: Option<PathBuf>) -> Result<PathBuf, PathError> {
-    match arg {
-        Some(p) => Ok(p),
-        None => active_config_path(&powertoys_dir().ok_or(PathError::DirNotFound)?),
-    }
 }
 
 /// `dir` の `settings.json` の `activeConfiguration` に `.json` を付けたパス。
@@ -446,9 +467,100 @@ mod tests {
         }
     }
 
+    /// 一時ディレクトリの中の PowerToys の設定フォルダ(まだ作らない)。
+    fn powertoys_root_in(tmp: &tempfile::TempDir) -> PathBuf {
+        tmp.path().join("Microsoft").join("PowerToys")
+    }
+
     #[test]
-    fn resolve_path_prefers_argument() {
-        let arg = PathBuf::from("/tmp/some/file.json");
-        assert_eq!(resolve_path(Some(arg.clone())), Ok(arg));
+    fn detect_not_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = powertoys_root_in(&tmp);
+        assert_eq!(detect(&root), Ok(PowerToysState::NotInstalled));
+        // フォルダの位置にファイルがあっても入っていないとみなす
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        std::fs::write(&root, "x").unwrap();
+        assert_eq!(detect(&root), Ok(PowerToysState::NotInstalled));
+        // 何も作らない
+        assert!(root.is_file());
+    }
+
+    #[test]
+    fn detect_not_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = powertoys_root_in(&tmp);
+        std::fs::create_dir_all(&root).unwrap();
+        // Keyboard Manager のフォルダがない
+        assert_eq!(detect(&root), Ok(PowerToysState::NotConfigured));
+        assert!(!root.join(KEYBOARD_MANAGER_DIR).exists());
+
+        // フォルダはあるが定義ファイルがない(settings.json もない → default.json を探す)
+        let km = root.join(KEYBOARD_MANAGER_DIR);
+        std::fs::create_dir(&km).unwrap();
+        assert_eq!(detect(&root), Ok(PowerToysState::NotConfigured));
+        // settings.json だけあって、activeConfiguration の定義ファイルがない
+        std::fs::write(
+            km.join("settings.json"),
+            r#"{"properties":{"activeConfiguration":{"value":"gaming"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(km.join("default.json"), "{}").unwrap();
+        assert_eq!(detect(&root), Ok(PowerToysState::NotConfigured));
+        // 何も作らない
+        assert!(!km.join("gaming.json").exists());
+    }
+
+    #[test]
+    fn detect_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = powertoys_root_in(&tmp);
+        let km = root.join(KEYBOARD_MANAGER_DIR);
+        std::fs::create_dir_all(&km).unwrap();
+        // settings.json がなければ default.json を使う
+        std::fs::write(km.join("default.json"), "{}").unwrap();
+        assert_eq!(
+            detect(&root),
+            Ok(PowerToysState::Ready {
+                dir: km.clone(),
+                definition: km.join("default.json"),
+            })
+        );
+        // settings.json があれば activeConfiguration のもの
+        std::fs::write(
+            km.join("settings.json"),
+            r#"{"properties":{"activeConfiguration":{"value":"gaming"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(km.join("gaming.json"), "{}").unwrap();
+        assert_eq!(
+            detect(&root),
+            Ok(PowerToysState::Ready {
+                dir: km.clone(),
+                definition: km.join("gaming.json"),
+            })
+        );
+    }
+
+    #[test]
+    fn detect_reports_unreadable_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = powertoys_root_in(&tmp);
+        let km = root.join(KEYBOARD_MANAGER_DIR);
+        std::fs::create_dir_all(&km).unwrap();
+        std::fs::write(km.join("default.json"), "{}").unwrap();
+        std::fs::write(km.join("settings.json"), "not json").unwrap();
+        assert!(matches!(
+            detect(&root),
+            Err(PathError::SettingsUnreadable(_))
+        ));
+        std::fs::write(
+            km.join("settings.json"),
+            r#"{"properties":{"activeConfiguration":{"value":"../x"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect(&root),
+            Err(PathError::UnsafeConfiguration("../x".to_owned()))
+        );
     }
 }

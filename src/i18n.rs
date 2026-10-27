@@ -81,6 +81,9 @@ pub enum Msg {
     RestoreFailed,
     InitialBackupSkippedByArgument,
     SaveBlockedByInitialBackup,
+    PowerToysNotInstalled,
+    KeyboardManagerNotConfigured,
+    Recheck,
 }
 
 impl Msg {
@@ -154,6 +157,9 @@ impl Msg {
         Msg::RestoreFailed,
         Msg::InitialBackupSkippedByArgument,
         Msg::SaveBlockedByInitialBackup,
+        Msg::PowerToysNotInstalled,
+        Msg::KeyboardManagerNotConfigured,
+        Msg::Recheck,
     ];
 }
 
@@ -267,6 +273,13 @@ fn en(msg: Msg) -> &'static str {
         Msg::SaveBlockedByInitialBackup => {
             "Saving is disabled until the backup of the settings from before installation has been created (it will be tried again at next launch)."
         }
+        Msg::PowerToysNotInstalled => {
+            "PowerToys was not found. Install PowerToys first (see the official installation page below), then press Check again."
+        }
+        Msg::KeyboardManagerNotConfigured => {
+            "PowerToys Keyboard Manager settings were not found. Turn on Keyboard Manager once in the PowerToys settings, then press Check again."
+        }
+        Msg::Recheck => "Check again",
     }
 }
 

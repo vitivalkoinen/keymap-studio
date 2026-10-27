@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod applog;
 mod config;
 mod edit;
 mod i18n;
@@ -15,40 +16,39 @@ use std::{
     sync::Arc,
 };
 
-use config::{Config, KeyCode, PathError, Remap};
+use applog::Log;
+use config::{Config, KeyCode, PathError, PowerToysState, Remap};
 use eframe::egui;
 use i18n::{Lang, Msg, tr};
 use layout::Layout;
 use matching::{KeyRemapLabel, KeyState, Role, SourceMap};
 
+/// PowerToys のインストール方法の公式ページ(§1.1)。
+const POWERTOYS_INSTALL_URL: &str = "https://learn.microsoft.com/windows/powertoys/install";
+
 fn main() -> eframe::Result {
     // 引数でパスを指定できる(WSL での開発時は /mnt/c/... を渡す)。
-    // 指定がなければ settings.json の activeConfiguration から決める。読み込みと保存は同じファイル。
+    // 指定がなければ PowerToys の状態を判定し(§1.1)、settings.json の activeConfiguration から
+    // 決める。読み込みと保存は同じファイル。
     let arg = std::env::args_os().nth(1).map(PathBuf::from);
-    // 導入前の設定のバックアップ(§4.7)は PowerToys の実際の設定フォルダだけを対象にする。
-    // 引数で指定したファイルは開発・テスト用なので、バックアップも復元もしない。
-    let initial = if arg.is_some() {
-        InitialBackup::SkippedByArgument
-    } else {
-        InitialBackup::ensure()
-    };
-    let path = config::resolve_path(arg);
+    let log = Log::default_location();
+    let app = App::new(arg, Places::default_locations(), log);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 600.0]),
         ..Default::default()
     };
-    eframe::run_native(
-        "Keymap Studio",
-        options,
-        Box::new(|_cc| Ok(Box::new(App::new(path, initial)))),
-    )
+    eframe::run_native("Keymap Studio", options, Box::new(|_cc| Ok(Box::new(app))))
 }
 
 /// 設定ファイルを読めなかった理由。
 enum LoadError {
-    /// 既定のパスが分からない
+    /// 既定のパスが分からない(`%LOCALAPPDATA%` が分からない)
     PathNotFound,
+    /// PowerToys が入っていない(§1.1)
+    PowerToysNotInstalled,
+    /// Keyboard Manager の設定がない(§1.1)
+    KeyboardManagerNotConfigured,
     /// `settings.json` があるのに読めない・解析できない(詳細はそのまま表示する)
     SettingsUnreadable(String),
     /// `settings.json` の `activeConfiguration` が安全なファイル名でない(値をそのまま持つ)
@@ -61,6 +61,10 @@ impl LoadError {
     fn message(&self, lang: Lang) -> String {
         match self {
             LoadError::PathNotFound => tr(lang, Msg::ConfigPathNotFound).to_owned(),
+            LoadError::PowerToysNotInstalled => tr(lang, Msg::PowerToysNotInstalled).to_owned(),
+            LoadError::KeyboardManagerNotConfigured => {
+                tr(lang, Msg::KeyboardManagerNotConfigured).to_owned()
+            }
             LoadError::SettingsUnreadable(detail) => {
                 format!("{}: {detail}", tr(lang, Msg::SettingsLoadFailed))
             }
@@ -72,10 +76,19 @@ impl LoadError {
     }
 }
 
+impl LoadError {
+    /// PowerToys の状態による案内か(§1.1)。案内と「再確認」のボタンを出す
+    fn is_powertoys_guidance(&self) -> bool {
+        matches!(
+            self,
+            LoadError::PowerToysNotInstalled | LoadError::KeyboardManagerNotConfigured
+        )
+    }
+}
+
 impl From<PathError> for LoadError {
     fn from(e: PathError) -> Self {
         match e {
-            PathError::DirNotFound => LoadError::PathNotFound,
             PathError::SettingsUnreadable(detail) => LoadError::SettingsUnreadable(detail),
             PathError::UnsafeConfiguration(value) => LoadError::UnsafeConfiguration(value),
         }
@@ -86,10 +99,10 @@ impl From<PathError> for LoadError {
 enum InitialBackup {
     /// 引数でファイルを指定して起動したので扱わない
     SkippedByArgument,
+    /// PowerToys の設定が使える状態でない(§1.1)ので、まだ試していない
+    NotAttempted,
     /// データフォルダ(exe と同じフォルダ)が分からない
     DataDirNotFound,
-    /// Keyboard Manager の設定フォルダが分からない
-    SourceDirNotFound,
     /// 作れなかった、または前に作ったものを読めなかった(詳細はそのまま表示する)。
     /// 次の起動で再び試す
     Failed(String),
@@ -103,24 +116,33 @@ enum InitialBackup {
 }
 
 impl InitialBackup {
-    /// バックアップがなければ作る。すでにあれば読む。
-    fn ensure() -> Self {
-        let Some(dir) = initial_backup::default_dir() else {
+    /// `dir` にバックアップがなければ `source`(Keyboard Manager の設定フォルダ)から作る。
+    /// すでにあれば読む。結果をログに残す。
+    fn ensure(dir: Option<&Path>, source: &Path, log: &Log) -> Self {
+        let Some(dir) = dir else {
+            log.write("initial backup: failed: data folder not found");
             return InitialBackup::DataDirNotFound;
         };
-        let Some(source) = config::powertoys_dir() else {
-            return InitialBackup::SourceDirNotFound;
-        };
-        match initial_backup::ensure(&dir, &source, std::time::SystemTime::now()) {
+        match initial_backup::ensure(dir, source, std::time::SystemTime::now()) {
             Ok(outcome) => {
                 let created = matches!(outcome, initial_backup::Outcome::Created(_));
+                let manifest = outcome.manifest().clone();
+                log.write(&format!(
+                    "initial backup: {} {} (created at {})",
+                    if created { "created" } else { "already exists" },
+                    dir.display(),
+                    manifest.created_at
+                ));
                 InitialBackup::Ready {
-                    dir,
-                    manifest: outcome.manifest().clone(),
+                    dir: dir.to_owned(),
+                    manifest,
                     created,
                 }
             }
-            Err(e) => InitialBackup::Failed(e),
+            Err(e) => {
+                log.write(&format!("initial backup: failed: {e}"));
+                InitialBackup::Failed(e)
+            }
         }
     }
 
@@ -129,8 +151,8 @@ impl InitialBackup {
     fn blocks_save(&self) -> bool {
         match self {
             InitialBackup::SkippedByArgument | InitialBackup::Ready { .. } => false,
-            InitialBackup::DataDirNotFound
-            | InitialBackup::SourceDirNotFound
+            InitialBackup::NotAttempted
+            | InitialBackup::DataDirNotFound
             | InitialBackup::Failed(_) => true,
         }
     }
@@ -148,8 +170,9 @@ impl InitialBackup {
                 false,
                 tr(lang, Msg::InitialBackupSkippedByArgument).to_owned(),
             )),
+            // PowerToys の状態の案内を別に出す
+            InitialBackup::NotAttempted => None,
             InitialBackup::DataDirNotFound => failed(tr(lang, Msg::DataDirNotFound)),
-            InitialBackup::SourceDirNotFound => failed(tr(lang, Msg::ConfigPathNotFound)),
             InitialBackup::Failed(d) => failed(d),
             InitialBackup::Ready {
                 dir, created: true, ..
@@ -158,6 +181,93 @@ impl InitialBackup {
                 format!("{}: {}", tr(lang, Msg::InitialBackupCreated), dir.display()),
             )),
             InitialBackup::Ready { created: false, .. } => None,
+        }
+    }
+}
+
+/// PowerToys の設定と本アプリのデータの場所。テストでは一時ディレクトリに差し替える。
+#[derive(Debug, Clone)]
+struct Places {
+    /// PowerToys の設定フォルダ(`%LOCALAPPDATA%\Microsoft\PowerToys`)
+    powertoys_root: Option<PathBuf>,
+    /// 導入前の設定のバックアップのフォルダ(exe と同じフォルダの `initial-backup`)
+    initial_backup_dir: Option<PathBuf>,
+    /// 世代バックアップを置くフォルダ(exe と同じフォルダの `backups`)
+    backup_dir: Option<PathBuf>,
+}
+
+impl Places {
+    fn default_locations() -> Self {
+        Self {
+            powertoys_root: config::powertoys_root(),
+            initial_backup_dir: initial_backup::default_dir(),
+            backup_dir: save::default_backup_dir(),
+        }
+    }
+}
+
+/// 読み書きする設定ファイルと、その読み込み・初回のバックアップの結果。
+struct Opened {
+    path: Option<PathBuf>,
+    doc: Result<Document, LoadError>,
+    initial: InitialBackup,
+}
+
+impl Opened {
+    /// 引数で指定したファイルを開く。PowerToys の状態の判定も初回のバックアップもしない(§1.1)。
+    fn argument(path: PathBuf, log: &Log) -> Self {
+        log.write(&format!(
+            "open: file specified on the command line: {}",
+            path.display()
+        ));
+        Opened {
+            doc: Document::load(&path).map_err(LoadError::Failed),
+            path: Some(path),
+            initial: InitialBackup::SkippedByArgument,
+        }
+    }
+
+    /// PowerToys の状態を判定し(§1.1)、通常なら初回のバックアップをしてから読み込む。
+    /// 通常でなければ、編集・保存・初回のバックアップをせず案内だけを出す。
+    /// 設定フォルダや定義ファイルは作らない。
+    fn powertoys(places: &Places, log: &Log) -> Self {
+        let not_ready = |doc: LoadError| Opened {
+            path: None,
+            doc: Err(doc),
+            initial: InitialBackup::NotAttempted,
+        };
+        let Some(root) = &places.powertoys_root else {
+            log.write("powertoys: %LOCALAPPDATA% not found");
+            return not_ready(LoadError::PathNotFound);
+        };
+        match config::detect(root) {
+            Ok(PowerToysState::NotInstalled) => {
+                log.write(&format!("powertoys: not installed ({})", root.display()));
+                not_ready(LoadError::PowerToysNotInstalled)
+            }
+            Ok(PowerToysState::NotConfigured) => {
+                log.write(&format!(
+                    "powertoys: Keyboard Manager not configured ({})",
+                    root.display()
+                ));
+                not_ready(LoadError::KeyboardManagerNotConfigured)
+            }
+            Err(e) => {
+                log.write(&format!(
+                    "powertoys: cannot determine the config file: {e:?}"
+                ));
+                not_ready(e.into())
+            }
+            Ok(PowerToysState::Ready { dir, definition }) => {
+                log.write(&format!("powertoys: ready ({})", definition.display()));
+                let initial =
+                    InitialBackup::ensure(places.initial_backup_dir.as_deref(), &dir, log);
+                Opened {
+                    doc: Document::load(&definition).map_err(LoadError::Failed),
+                    path: Some(definition),
+                    initial,
+                }
+            }
         }
     }
 }
@@ -318,10 +428,13 @@ struct App {
     selected: Option<usize>,
     /// リマップ先として選べるキーコード
     choices: Vec<KeyCode>,
-    /// 世代バックアップを置くフォルダ(exe と同じフォルダの `backups`)
-    backup_dir: Option<PathBuf>,
+    /// 引数でファイルを指定して起動した(PowerToys の状態の判定をしない)
+    from_argument: bool,
+    /// PowerToys の設定と本アプリのデータの場所
+    places: Places,
     /// 導入前の設定のバックアップ
     initial: InitialBackup,
+    log: Log,
     status: Option<Status>,
     dialog: Option<Dialog>,
     /// 未保存の変更があっても閉じてよい(確認ダイアログで保存または破棄を選んだ)
@@ -329,27 +442,48 @@ struct App {
 }
 
 impl App {
-    fn new(path: Result<PathBuf, PathError>, initial: InitialBackup) -> Self {
-        let (path, doc) = match path {
-            Ok(p) => {
-                let doc = Document::load(&p).map_err(LoadError::Failed);
-                (Some(p), doc)
-            }
-            Err(e) => (None, Err(e.into())),
+    /// `arg` があればそのファイルを開く。なければ PowerToys の状態を判定して開く。
+    fn new(arg: Option<PathBuf>, places: Places, log: Log) -> Self {
+        let from_argument = arg.is_some();
+        let opened = match arg {
+            Some(p) => Opened::argument(p, &log),
+            None => Opened::powertoys(&places, &log),
         };
         Self {
             lang: Lang::default(),
-            path,
-            doc,
+            path: opened.path,
+            doc: opened.doc,
             layout: Layout::us_ansi(),
             selected: None,
             choices: keys::target_choices(),
-            backup_dir: save::default_backup_dir(),
-            initial,
+            from_argument,
+            places,
+            initial: opened.initial,
+            log,
             status: None,
             dialog: None,
             allow_close: false,
         }
+    }
+
+    /// PowerToys の状態を判定し直し、通常になっていれば初回のバックアップと読み込みに進む
+    /// (「再確認」のボタン)。
+    fn recheck(&mut self) {
+        if self.from_argument {
+            return;
+        }
+        let opened = Opened::powertoys(&self.places, &self.log);
+        self.path = opened.path;
+        self.doc = opened.doc;
+        self.initial = opened.initial;
+        self.status = None;
+    }
+
+    /// 結果を `status` に入れ、ログに残す。
+    fn set_status(&mut self, what: &str, status: Status) {
+        self.log
+            .write(&format!("{what}: {}", status.message(Lang::En)));
+        self.status = Some(status);
     }
 
     fn is_dirty(&self) -> bool {
@@ -362,15 +496,15 @@ impl App {
             return;
         };
         if self.initial.blocks_save() {
-            self.status = Some(Status::SaveBlockedByInitialBackup);
+            self.set_status("save", Status::SaveBlockedByInitialBackup);
             return;
         }
-        let Some(backup_dir) = &self.backup_dir else {
-            self.status = Some(Status::BackupDirNotFound);
+        let Some(backup_dir) = &self.places.backup_dir else {
+            self.set_status("save", Status::BackupDirNotFound);
             return;
         };
         let opts = save::Options::new(backup_dir.clone());
-        self.status = Some(match save::save(path, &doc.config, &doc.snapshot, &opts) {
+        let status = match save::save(path, &doc.config, &doc.snapshot, &opts) {
             Ok(written) => {
                 doc.snapshot = written;
                 doc.saved = doc.current();
@@ -380,11 +514,32 @@ impl App {
                 }
             }
             Err(e) => Status::SaveFailed(e),
-        });
+        };
+        self.set_status(&format!("save {}", path.display()), status);
     }
 
     /// ファイルを読み直す。編集中の内容は破棄する。失敗したら編集中の内容を残す。
+    ///
+    /// 引数で指定したファイルでなければ、PowerToys の状態も判定し直す(§1.1)。通常でなくなって
+    /// いれば案内に切り替える。
     fn reload(&mut self) {
+        if !self.from_argument {
+            let opened = Opened::powertoys(&self.places, &self.log);
+            match (&opened.doc, &opened.path) {
+                // 同じファイルを読めなかったときは編集中の内容を残す
+                (Err(LoadError::Failed(e)), Some(p)) if self.path.as_ref() == Some(p) => {
+                    self.status = Some(Status::ReloadFailed(e.clone()));
+                    self.initial = opened.initial;
+                }
+                _ => {
+                    self.status = opened.doc.is_ok().then_some(Status::Reloaded);
+                    self.path = opened.path;
+                    self.doc = opened.doc;
+                    self.initial = opened.initial;
+                }
+            }
+            return;
+        }
         let Some(path) = &self.path else {
             return;
         };
@@ -406,7 +561,7 @@ impl App {
             InitialBackup::Ready { manifest, .. } => manifest,
             _ => return Some(tr(lang, Msg::RestoreUnavailableNoBackup).to_owned()),
         };
-        if self.backup_dir.is_none() {
+        if self.places.backup_dir.is_none() {
             return Some(tr(lang, Msg::BackupDirNotFound).to_owned());
         }
         let Some(path) = &self.path else {
@@ -430,24 +585,25 @@ impl App {
     /// 編集中の内容は破棄する。
     fn restore(&mut self) {
         let (Some(path), Some(backup_dir), InitialBackup::Ready { dir, manifest, .. }) =
-            (&self.path, &self.backup_dir, &self.initial)
+            (&self.path, &self.places.backup_dir, &self.initial)
         else {
             return;
         };
+        let what = format!("restore {}", path.display());
         let contents = match initial_backup::definition_contents(dir, manifest) {
             Ok(c) => c,
             Err(e) => {
-                self.status = Some(Status::RestoreBackupUnreadable(e));
+                self.set_status(&what, Status::RestoreBackupUnreadable(e));
                 return;
             }
         };
         let opts = save::Options::new(backup_dir.clone());
         if let Err(e) = save::overwrite(path, &contents, &opts) {
-            self.status = Some(Status::RestoreFailed(e));
+            self.set_status(&what, Status::RestoreFailed(e));
             return;
         }
         let signal = save::signal_settings_changed();
-        self.status = Some(match Document::load(path) {
+        let status = match Document::load(path) {
             Ok(doc) => {
                 self.doc = Ok(doc);
                 match signal {
@@ -456,7 +612,8 @@ impl App {
                 }
             }
             Err(e) => Status::RestoredReloadFailed(e, signal),
-        });
+        };
+        self.set_status(&what, status);
     }
 
     /// 戻す前の確認の文。何が起こるかと、未保存の変更が破棄されることを含める。
@@ -593,17 +750,20 @@ impl eframe::App for App {
             }
             let unavailable = self.restore_unavailable(lang);
             let mut restore = false;
-            ui.horizontal_wrapped(|ui| {
-                restore = ui
-                    .add_enabled(
-                        unavailable.is_none(),
-                        egui::Button::new(tr(lang, Msg::RestoreButton)),
-                    )
-                    .clicked();
-                if let Some(reason) = &unavailable {
-                    ui.weak(reason);
-                }
-            });
+            // PowerToys の設定が使える状態でないときは案内だけを出す(§1.1)
+            if !matches!(self.initial, InitialBackup::NotAttempted) {
+                ui.horizontal_wrapped(|ui| {
+                    restore = ui
+                        .add_enabled(
+                            unavailable.is_none(),
+                            egui::Button::new(tr(lang, Msg::RestoreButton)),
+                        )
+                        .clicked();
+                    if let Some(reason) = &unavailable {
+                        ui.weak(reason);
+                    }
+                });
+            }
             if restore {
                 self.dialog = Some(Dialog::Restore);
             }
@@ -630,6 +790,17 @@ impl eframe::App for App {
             }
             ui.separator();
             let doc = match &mut self.doc {
+                Err(e) if e.is_powertoys_guidance() => {
+                    ui.label(e.message(lang));
+                    if matches!(e, LoadError::PowerToysNotInstalled) {
+                        ui.hyperlink(POWERTOYS_INSTALL_URL);
+                    }
+                    ui.add_space(8.0);
+                    if ui.button(tr(lang, Msg::Recheck)).clicked() {
+                        self.recheck();
+                    }
+                    return;
+                }
                 Err(e) => {
                     ui.colored_label(ui.visuals().error_fg_color, e.message(lang));
                     return;
@@ -990,19 +1161,82 @@ fn format_keys(keys: &[KeyCode]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    const DEFAULT_JSON: &str = r#"{"remapKeys":{"inProcess":[{"originalKeys":"65","newRemapKeys":"66"}]},"remapKeysToText":{"inProcess":[]},"remapShortcuts":{"global":[],"appSpecific":[]},"remapShortcutsToText":{"global":[],"appSpecific":[]}}"#;
+
+    /// 一時ディレクトリの中の PowerToys の設定フォルダとデータフォルダ(PowerToys のフォルダは作らない)。
+    struct Env {
+        tmp: tempfile::TempDir,
+        places: Places,
+    }
+
+    impl Env {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            fs::create_dir(&data).unwrap();
+            let places = Places {
+                powertoys_root: Some(tmp.path().join("Microsoft").join("PowerToys")),
+                initial_backup_dir: Some(data.join(initial_backup::DIR_NAME)),
+                backup_dir: Some(data.join("backups")),
+            };
+            Env { tmp, places }
+        }
+
+        fn root(&self) -> PathBuf {
+            self.places.powertoys_root.clone().unwrap()
+        }
+
+        fn km(&self) -> PathBuf {
+            self.root().join(config::KEYBOARD_MANAGER_DIR)
+        }
+
+        fn log_path(&self) -> PathBuf {
+            self.tmp.path().join("data").join(applog::FILE_NAME)
+        }
+
+        fn log(&self) -> Log {
+            Log::new(Some(self.log_path()), applog::DEFAULT_MAX_BYTES)
+        }
+
+        fn log_text(&self) -> String {
+            fs::read_to_string(self.log_path()).unwrap_or_default()
+        }
+
+        /// Keyboard Manager の設定を用意する(settings.json はなし)。
+        fn install(&self) {
+            fs::create_dir_all(self.km()).unwrap();
+            fs::write(self.km().join("default.json"), DEFAULT_JSON).unwrap();
+        }
+
+        fn app(&self, arg: Option<PathBuf>) -> App {
+            App::new(arg, self.places.clone(), self.log())
+        }
+    }
+
+    fn edit_a_to_c(app: &mut App) {
+        let doc = app.doc.as_mut().ok().unwrap();
+        edit::set(
+            &mut doc.config.remap_keys.in_process,
+            KeyCode(0x41),
+            KeyCode(0x43),
+        );
+        assert!(app.is_dirty());
+    }
 
     #[test]
     fn save_is_blocked_only_while_initial_backup_is_missing() {
         assert!(!InitialBackup::SkippedByArgument.blocks_save());
+        assert!(InitialBackup::NotAttempted.blocks_save());
         assert!(InitialBackup::DataDirNotFound.blocks_save());
-        assert!(InitialBackup::SourceDirNotFound.blocks_save());
         assert!(InitialBackup::Failed("x".into()).blocks_save());
 
-        let tmp = tempfile::tempdir().unwrap();
-        let km = tmp.path().join("Keyboard Manager");
-        std::fs::create_dir(&km).unwrap();
-        let dir = tmp.path().join(initial_backup::DIR_NAME);
-        let outcome = initial_backup::ensure(&dir, &km, std::time::SystemTime::now()).unwrap();
+        let env = Env::new();
+        env.install();
+        let dir = env.places.initial_backup_dir.clone().unwrap();
+        let outcome =
+            initial_backup::ensure(&dir, &env.km(), std::time::SystemTime::now()).unwrap();
         let ready = InitialBackup::Ready {
             dir,
             manifest: outcome.manifest().clone(),
@@ -1012,20 +1246,130 @@ mod tests {
     }
 
     #[test]
-    fn save_is_refused_while_initial_backup_failed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("default.json");
-        let original = r#"{"remapKeys":{"inProcess":[]}}"#;
-        std::fs::write(&path, original).unwrap();
-        let mut app = App::new(Ok(path.clone()), InitialBackup::Failed("x".into()));
-        app.backup_dir = Some(tmp.path().join("backups"));
-        let doc = app.doc.as_mut().ok().unwrap();
-        edit::set(
-            &mut doc.config.remap_keys.in_process,
-            KeyCode(0x41),
-            KeyCode(0x42),
-        );
+    fn not_installed_shows_guidance_and_creates_nothing() {
+        let env = Env::new();
+        let app = env.app(None);
+        assert!(matches!(app.doc, Err(LoadError::PowerToysNotInstalled)));
+        assert!(app.path.is_none());
+        assert!(matches!(app.initial, InitialBackup::NotAttempted));
+        assert!(app.restore_unavailable(Lang::En).is_some());
+        assert!(!env.root().exists());
+        assert!(!env.places.initial_backup_dir.as_ref().unwrap().exists());
+        assert!(env.log_text().contains("powertoys: not installed"));
+    }
+
+    #[test]
+    fn not_configured_shows_guidance_and_creates_nothing() {
+        let env = Env::new();
+        fs::create_dir_all(env.root()).unwrap();
+        let app = env.app(None);
+        assert!(matches!(
+            app.doc,
+            Err(LoadError::KeyboardManagerNotConfigured)
+        ));
+        assert!(matches!(app.initial, InitialBackup::NotAttempted));
+        assert!(!env.km().exists());
+        assert!(!env.places.initial_backup_dir.as_ref().unwrap().exists());
+
+        // フォルダはあるが定義ファイルがない
+        fs::create_dir(env.km()).unwrap();
+        let app = env.app(None);
+        assert!(matches!(
+            app.doc,
+            Err(LoadError::KeyboardManagerNotConfigured)
+        ));
+        assert!(!env.km().join("default.json").exists());
+        assert!(env.log_text().contains("Keyboard Manager not configured"));
+    }
+
+    #[test]
+    fn recheck_proceeds_to_backup_and_load() {
+        let env = Env::new();
+        fs::create_dir_all(env.root()).unwrap();
+        let mut app = env.app(None);
+        assert!(app.doc.is_err());
+
+        env.install();
+        app.recheck();
+        assert_eq!(app.path, Some(env.km().join("default.json")));
+        assert!(app.doc.is_ok());
+        assert!(matches!(
+            app.initial,
+            InitialBackup::Ready { created: true, .. }
+        ));
+        assert!(app.restore_unavailable(Lang::En).is_none());
+        let log = env.log_text();
+        assert!(log.contains("powertoys: ready"), "{log}");
+        assert!(log.contains("initial backup: created"), "{log}");
+    }
+
+    #[test]
+    fn reload_detects_state_again() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        assert!(app.doc.is_ok());
+        fs::remove_dir_all(env.km()).unwrap();
+        app.reload();
+        assert!(matches!(
+            app.doc,
+            Err(LoadError::KeyboardManagerNotConfigured)
+        ));
+        assert!(app.path.is_none());
+    }
+
+    #[test]
+    fn reload_keeps_edits_when_file_cannot_be_parsed() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        edit_a_to_c(&mut app);
+        fs::write(env.km().join("default.json"), "broken").unwrap();
+        app.reload();
+        assert!(matches!(app.status, Some(Status::ReloadFailed(_))));
         assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn save_and_restore_in_powertoys_folder() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        let path = env.km().join("default.json");
+
+        edit_a_to_c(&mut app);
+        app.save();
+        assert!(!app.is_dirty());
+        assert_ne!(fs::read_to_string(&path).unwrap(), DEFAULT_JSON);
+
+        app.restore();
+        assert!(matches!(
+            app.status,
+            Some(Status::Restored | Status::RestoredNotApplied(_))
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), DEFAULT_JSON);
+        assert!(!app.is_dirty());
+        // 保存と復元のそれぞれで世代バックアップが残る
+        let generations = fs::read_dir(env.places.backup_dir.as_ref().unwrap())
+            .unwrap()
+            .count();
+        assert_eq!(generations, 2);
+        let log = env.log_text();
+        assert!(log.contains("save "), "{log}");
+        assert!(log.contains("restore "), "{log}");
+    }
+
+    #[test]
+    fn save_is_refused_while_initial_backup_failed() {
+        let mut env = Env::new();
+        env.install();
+        // データフォルダの位置がファイルなので初回のバックアップを作れない
+        let blocker = env.tmp.path().join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        env.places.initial_backup_dir = Some(blocker.join(initial_backup::DIR_NAME));
+        let mut app = env.app(None);
+        assert!(matches!(app.initial, InitialBackup::Failed(_)));
+        edit_a_to_c(&mut app);
 
         app.save();
         assert!(matches!(
@@ -1033,25 +1377,40 @@ mod tests {
             Some(Status::SaveBlockedByInitialBackup)
         ));
         assert!(app.is_dirty());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        assert!(!tmp.path().join("backups").exists());
+        let path = env.km().join("default.json");
+        assert_eq!(fs::read_to_string(&path).unwrap(), DEFAULT_JSON);
+        assert!(!env.places.backup_dir.as_ref().unwrap().exists());
+        let log = env.log_text();
+        assert!(log.contains("initial backup: failed"), "{log}");
+        assert!(log.contains("save: "), "{log}");
     }
 
     #[test]
-    fn argument_mode_shows_notice_and_disables_restore() {
+    fn argument_mode_skips_detection_and_backup() {
+        let env = Env::new();
+        let path = env.tmp.path().join("default.json");
+        fs::write(&path, DEFAULT_JSON).unwrap();
+        let mut app = env.app(Some(path.clone()));
+        assert!(app.doc.is_ok());
+        assert!(matches!(app.initial, InitialBackup::SkippedByArgument));
         let lang = Lang::En;
-        let notice = InitialBackup::SkippedByArgument.notice(lang);
         assert_eq!(
-            notice,
+            app.initial.notice(lang),
             Some((
                 false,
                 tr(lang, Msg::InitialBackupSkippedByArgument).to_owned()
             ))
         );
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("default.json");
-        std::fs::write(&path, "{}").unwrap();
-        let app = App::new(Ok(path), InitialBackup::SkippedByArgument);
         assert!(app.restore_unavailable(lang).is_some());
+        // 再確認は何もしない。PowerToys のフォルダもバックアップも作らない
+        app.recheck();
+        assert_eq!(app.path, Some(path));
+        assert!(!env.root().exists());
+        assert!(!env.places.initial_backup_dir.as_ref().unwrap().exists());
+
+        // 保存は止めない
+        edit_a_to_c(&mut app);
+        app.save();
+        assert!(!app.is_dirty());
     }
 }

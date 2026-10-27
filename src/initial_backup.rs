@@ -110,7 +110,24 @@ pub fn ensure(backup_dir: &Path, source_dir: &Path, now: SystemTime) -> Result<O
     if let Some(m) = load(backup_dir)? {
         return Ok(Outcome::Existing(m));
     }
-    create(backup_dir, source_dir, now).map(Outcome::Created)
+    create_or_adopt(backup_dir, source_dir, now)
+}
+
+/// バックアップを作る。作れなかったときに `backup_dir` ができていれば(二重起動した別の
+/// プロセスが先に作った、など)、それを読み直し、読めれば既にあるものとして扱う。
+fn create_or_adopt(
+    backup_dir: &Path,
+    source_dir: &Path,
+    now: SystemTime,
+) -> Result<Outcome, String> {
+    match create(backup_dir, source_dir, now) {
+        Ok(m) => Ok(Outcome::Created(m)),
+        Err(e) if backup_dir.exists() => match load(backup_dir) {
+            Ok(Some(m)) => Ok(Outcome::Existing(m)),
+            _ => Err(e),
+        },
+        Err(e) => Err(e),
+    }
 }
 
 /// 作成済みのバックアップの記録を読む。`backup_dir` がなければ `Ok(None)`。
@@ -254,7 +271,6 @@ fn write_synced(path: &Path, contents: &[u8]) -> io::Result<()> {
 
 fn path_error(e: PathError) -> String {
     match e {
-        PathError::DirNotFound => "Keyboard Manager folder not found".to_owned(),
         PathError::SettingsUnreadable(d) => d,
         PathError::UnsafeConfiguration(v) => {
             format!("activeConfiguration is not a safe file name: {v:?}")
@@ -463,6 +479,36 @@ mod tests {
         let m = ensure(&backup, &km, now()).unwrap().manifest().clone();
         assert!(!m.settings.existed && !m.editor_settings.existed && !m.definition.existed);
         drop(tmp);
+    }
+
+    #[test]
+    fn adopts_backup_created_concurrently() {
+        let (_tmp, km, backup) = setup();
+        // 別のプロセスが先に作り終えた状態で、こちらも作ろうとした(load の確認のあと)
+        let theirs = ensure(&backup, &km, now()).unwrap().manifest().clone();
+        fs::write(km.join("default.json"), "{}").unwrap();
+        let later = now() + Duration::from_secs(1);
+        let outcome = create_or_adopt(&backup, &km, later).unwrap();
+        let Outcome::Existing(m) = outcome else {
+            panic!("not adopted: {outcome:?}");
+        };
+        assert_eq!(m, theirs);
+        // 先に作られたものは変わらず、こちらの一時フォルダは残らない
+        assert_eq!(
+            fs::read_to_string(backup.join("config").join("default.json")).unwrap(),
+            DEFAULT_JSON
+        );
+        assert_eq!(names_in(backup.parent().unwrap()), vec![DIR_NAME]);
+    }
+
+    #[test]
+    fn concurrent_broken_backup_is_still_an_error() {
+        let (_tmp, km, backup) = setup();
+        // 置き換え先はあるが読めない(manifest.json がない)
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("note.txt"), "x").unwrap();
+        assert!(create_or_adopt(&backup, &km, now()).is_err());
+        assert_eq!(names_in(&backup), vec!["note.txt"]);
     }
 
     #[test]
