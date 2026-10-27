@@ -4,12 +4,11 @@
 //! 差し替えられるので、JIS 配列などは別のコンストラクタを足せば追加できる。
 
 use crate::config::{KeyCode, NUMPAD_ORIGIN_FLAG};
-use crate::keys;
 
 /// 配列上の 1 キー(物理キー)。座標はキーの左上で、単位は 1u。
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyDef {
-    /// このキーが出しうるキーコード(正規化済み。[`keys::normalize`] を通した値)。
+    /// このキーが出しうるキーコード(正規化済み。[`crate::keys::normalize`] を通した値)。
     ///
     /// 先頭が主のコードで、表示名にはこれを使う。テンキーのように NumLock の状態で
     /// 別の VK を出すキーは、残りにそれらを持つ。
@@ -34,12 +33,6 @@ impl KeyDef {
 }
 
 impl Layout {
-    /// `code` を出す物理キーの添字。配列にないコードなら `None`。
-    pub fn find(&self, code: KeyCode) -> Option<usize> {
-        let code = keys::normalize(code);
-        self.keys.iter().position(|k| k.codes.contains(&code))
-    }
-
     /// 配列全体の幅と高さ(単位は 1u)。
     pub fn size(&self) -> (f32, f32) {
         self.keys.iter().fold((0.0, 0.0), |(w, h), k| {
@@ -229,8 +222,20 @@ impl Builder {
 }
 
 #[cfg(test)]
+impl Layout {
+    /// `code` を出す物理キーの添字。配列にないコードなら `None`。
+    ///
+    /// テストでだけ使う(キーボード図は各キーの `codes` から状態を決める)。
+    pub fn find(&self, code: KeyCode) -> Option<usize> {
+        let code = crate::keys::normalize(code);
+        self.keys.iter().position(|k| k.codes.contains(&code))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys;
 
     #[test]
     fn us_ansi_has_104_keys() {

@@ -73,6 +73,7 @@ Windows 11 の PowerToys Keyboard Manager のキーリマップを、キーボ�
 - UI 文字列を言語ごとの対応表から引く土台(英語のみ)
 - キー→キーのリマップの追加・変更・削除(リマップ先は表示名つきの一覧から選ぶ。テンキー由来のフラグ付きコードはリマップ先に選べない)
 - 保存(§4.8)。未保存のまま閉じるときの確認、外部の変更を検知したあとの読み直し
+- キーボード図の表示(§4.9): 変換先の併記、リマップなし/保存済み/未保存の色分け、未保存時の保存ボタンの強調
 
 ### 4.2 予定
 
@@ -152,6 +153,18 @@ Windows 11 の PowerToys Keyboard Manager のキーリマップを、キーボ�
   - 根拠: PowerToys 自身も保存後に同じことをしている(`src/modules/keyboardmanager/common/MappingConfiguration.cpp` の `SaveSettingsToFile` が `CreateEvent(nullptr, false, false, SettingsEventName)` → `SetEvent`)。エンジンはこのイベントを待ち受けて設定を読み直す(`KeyboardManagerEngineLibrary/KeyboardManager.cpp`)。イベント名は `common/KeyboardManagerConstants.h` の `SettingsEventName`
   - シグナルに失敗したとき(PowerToys が起動していない、など)は、保存は成功として扱い、反映されていない可能性をユーザーに知らせる
 - 書き込むファイル名は `settings.json` の `activeConfiguration` に `.json` を付けたもの(既定 `default.json`)。PowerToys も `currentConfig + ".json"` に保存している
+
+- Windows の実機での確認(2026-10-28、ユーザーの環境): 保存とイベントによる即時反映、テンキーの / のリマップ、PowerToys のエディタを開いたままの保存(止まらずに保存できた)、未保存で閉じるときの確認が、すべて想定どおりに動いた
+
+### 4.9 キーボード図の表示
+
+- リマップ元のキーには、元の名前を小さく、変換先の名前を大きく表示する(例: 上に "F12"、下に "→ A")。リスト以外でもリマップの結果が一目で分かるようにする
+  - 複数のコードを持つキー(テンキーなど)で、複数のコードがリマップされている場合の表示は実装で工夫する(例: 主のコードを優先し、ほかにもあることを印で示す)
+- キーの色で状態を区別する
+  - リマップなし
+  - 保存済みのリマップ
+  - 未保存の変更があるキー(追加・変更・削除のいずれも。保存済みの内容と比べて違うもの)
+- 未保存の変更があるときは、保存ボタンを目立たせる(強調色など)
 
 ## 5. 未決定事項
 

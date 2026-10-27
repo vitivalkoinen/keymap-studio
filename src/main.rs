@@ -3,18 +3,19 @@
 mod config;
 mod edit;
 mod i18n;
+mod keycap;
 mod keys;
 mod layout;
 mod matching;
 mod save;
 
-use std::{collections::HashSet, path::PathBuf};
+use std::{path::PathBuf, sync::Arc};
 
 use config::{Config, KeyCode, PathError, Remap};
 use eframe::egui;
 use i18n::{Lang, Msg, tr};
 use layout::Layout;
-use matching::Role;
+use matching::{KeyRemapLabel, KeyState, Role, SourceMap};
 
 fn main() -> eframe::Result {
     // 引数でパスを指定できる(WSL での開発時は /mnt/c/... を渡す)。
@@ -74,17 +75,36 @@ struct Document {
     config: Config,
     /// 読み込んだ(または最後に保存した)時点のファイルの内容。外部の変更の検知に使う
     snapshot: Vec<u8>,
-    /// 保存していない変更があるか
-    dirty: bool,
+    /// 読み込んだ(または最後に保存した)時点のキー→キーのリマップ。未保存の変更の判定に使う
+    saved: SourceMap,
 }
 
 impl Document {
     fn load(path: &std::path::Path) -> Result<Self, String> {
         config::load(path).map(|(config, snapshot)| Document {
+            saved: matching::source_map(&config.remap_keys.in_process),
             config,
             snapshot,
-            dirty: false,
         })
+    }
+
+    /// 今のキー→キーのリマップ。
+    fn current(&self) -> SourceMap {
+        matching::source_map(&self.config.remap_keys.in_process)
+    }
+
+    /// 保存していない変更があるか。
+    ///
+    /// 編集のたびに立てるフラグではなく、保存済みの内容と比べて決める。編集を元に戻して
+    /// 差がなくなれば未保存ではなくなる。比べるのはキー→キーのリマップだけ
+    /// (編集できるのはそこだけのため)。
+    ///
+    /// 比べる単位は、`originalKeys` と `newRemapKeys` を解析したキーコードの値
+    /// ([`matching::source_map`])。ファイル上の文字列は比べないので、表記の違い
+    /// (リマップ元の正規化で同じになるフラグの有無など)・エントリの並び順・未知のフィールドは
+    /// 差とみなさない。
+    fn is_dirty(&self) -> bool {
+        self.current() != self.saved
     }
 }
 
@@ -203,7 +223,7 @@ impl App {
     }
 
     fn is_dirty(&self) -> bool {
-        self.doc.as_ref().is_ok_and(|d| d.dirty)
+        self.doc.as_ref().is_ok_and(Document::is_dirty)
     }
 
     /// 編集中の設定を保存し、結果を `status` に入れる。
@@ -219,7 +239,7 @@ impl App {
         self.status = Some(match save::save(path, &doc.config, &doc.snapshot, &opts) {
             Ok(written) => {
                 doc.snapshot = written;
-                doc.dirty = false;
+                doc.saved = doc.current();
                 match save::signal_settings_changed() {
                     Ok(()) => Status::Saved,
                     Err(e) => Status::SavedNotApplied(e),
@@ -317,11 +337,11 @@ impl eframe::App for App {
                 ui.label(p.display().to_string());
             }
             if let Ok(doc) = &self.doc {
-                let dirty = doc.dirty;
+                let dirty = doc.is_dirty();
                 let mut clicked = false;
                 ui.horizontal(|ui| {
                     clicked = ui
-                        .add_enabled(dirty, egui::Button::new(tr(lang, Msg::Save)))
+                        .add_enabled(dirty, save_button(ui, lang, dirty))
                         .clicked();
                     if dirty {
                         ui.colored_label(ui.visuals().warn_fg_color, tr(lang, Msg::UnsavedChanges));
@@ -366,15 +386,29 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading(tr(lang, Msg::KeyboardHeading));
                 let remaps = &doc.config.remap_keys.in_process;
-                let marked = matching::remapped_keys(&self.layout, remaps);
+                let current = doc.current();
+                let states = matching::key_states(&self.layout, &doc.saved, &current);
+                let labels: Vec<_> = self
+                    .layout
+                    .keys
+                    .iter()
+                    .map(|k| matching::key_remap_label(k, &current))
+                    .collect();
                 // 狭いウィンドウでも右端が切れないよう、図は横スクロールの中に置く。
                 let width = ui.available_width();
                 egui::ScrollArea::horizontal()
                     .id_salt("keyboard")
                     .show(ui, |ui| {
-                        keyboard(ui, width, &self.layout, &marked, &mut self.selected);
+                        keyboard(
+                            ui,
+                            width,
+                            &self.layout,
+                            &states,
+                            &labels,
+                            &mut self.selected,
+                        );
                     });
-                ui.label(tr(lang, Msg::LegendRemapSource));
+                legend(ui, lang);
                 ui.separator();
 
                 ui.heading(tr(lang, Msg::SelectedKeyHeading));
@@ -407,7 +441,6 @@ impl eframe::App for App {
                     Edit::Remove(source) => edit::remove(remaps, source),
                 };
                 if changed {
-                    doc.dirty = true;
                     self.status = None;
                 }
             }
@@ -416,36 +449,68 @@ impl eframe::App for App {
     }
 }
 
+/// 保存ボタン。未保存の変更があるときは未保存のキーと同じ色で塗って目立たせる。
+fn save_button(ui: &egui::Ui, lang: Lang, dirty: bool) -> egui::Button<'static> {
+    if !dirty {
+        return egui::Button::new(tr(lang, Msg::Save));
+    }
+    let visuals = ui.visuals();
+    let text = egui::RichText::new(tr(lang, Msg::Save))
+        .strong()
+        .color(visuals.strong_text_color());
+    egui::Button::new(text).fill(keycap::unsaved_fill(visuals.dark_mode))
+}
+
+/// キーボード図の色と印の凡例。
+fn legend(ui: &mut egui::Ui, lang: Lang) {
+    let dark = ui.visuals().dark_mode;
+    let swatch = |ui: &mut egui::Ui, color: egui::Color32| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+        let stroke = ui.visuals().widgets.inactive.bg_stroke;
+        ui.painter()
+            .rect(rect, 2.0, color, stroke, egui::StrokeKind::Inside);
+    };
+    ui.horizontal_wrapped(|ui| {
+        swatch(ui, keycap::saved_fill(dark));
+        ui.label(tr(lang, Msg::LegendRemapped));
+        ui.add_space(12.0);
+        swatch(ui, keycap::unsaved_fill(dark));
+        ui.label(tr(lang, Msg::LegendUnsaved));
+        ui.add_space(12.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+        let color = ui.visuals().strong_text_color();
+        ui.painter().circle_filled(rect.center(), 3.0, color);
+        ui.label(tr(lang, Msg::LegendMoreRemaps));
+    });
+}
+
 /// キーボード図を描き、クリックされたキーの添字を `selected` に入れる。
 ///
 /// `width` は図に使える幅。キーの大きさはこれに合わせるが、下限より狭いときは
-/// 図がはみ出す(呼び出し側の横スクロールで見る)。
+/// 図がはみ出す(呼び出し側の横スクロールで見る)。`states` と `labels` は
+/// `layout.keys` と同じ順の、各キーの状態と併記する変換先。
 fn keyboard(
     ui: &mut egui::Ui,
     width: f32,
     layout: &Layout,
-    marked: &HashSet<usize>,
+    states: &[KeyState],
+    labels: &[Option<KeyRemapLabel>],
     selected: &mut Option<usize>,
 ) {
     let (w, h) = layout.size();
     // 1u の大きさ。幅に合わせて伸縮させるが、極端に小さく・大きくはしない。
-    let unit = (width / w).clamp(28.0, 52.0);
+    let unit = (width / w).clamp(keycap::MIN_UNIT, keycap::MAX_UNIT);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w * unit, h * unit), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals().clone();
-    let source_fill = if visuals.dark_mode {
-        egui::Color32::from_rgb(0xA0, 0x55, 0x1E)
-    } else {
-        egui::Color32::from_rgb(0xF5, 0xB0, 0x6B)
-    };
-    let font = egui::FontId::proportional((unit * 0.26).max(9.0));
+    let font = egui::FontId::proportional(keycap::single_size(unit));
 
     for (i, k) in layout.keys.iter().enumerate() {
         let key_rect = egui::Rect::from_min_size(
             rect.min + egui::vec2(k.x * unit, k.y * unit),
             egui::vec2(k.w * unit, k.h * unit),
         )
-        .shrink(2.0);
+        .shrink(keycap::KEY_GAP);
         let response = ui.interact(
             key_rect,
             ui.scope_id().with(("key", i)),
@@ -455,13 +520,12 @@ fn keyboard(
             *selected = Some(i);
         }
 
-        let fill = if marked.contains(&i) {
-            source_fill
-        } else if response.hovered() {
-            visuals.widgets.hovered.weak_bg_fill
-        } else {
-            visuals.widgets.inactive.weak_bg_fill
-        };
+        let fill =
+            keycap::state_fill(states[i], visuals.dark_mode).unwrap_or(if response.hovered() {
+                visuals.widgets.hovered.weak_bg_fill
+            } else {
+                visuals.widgets.inactive.weak_bg_fill
+            });
         let stroke = if *selected == Some(i) {
             egui::Stroke::new(2.5, visuals.strong_text_color())
         } else if response.hovered() {
@@ -471,15 +535,100 @@ fn keyboard(
         };
         painter.rect(key_rect, 3.0, fill, stroke, egui::StrokeKind::Inside);
 
-        let galley = painter.layout(
-            keys::name(k.primary()),
-            font.clone(),
-            visuals.strong_text_color(),
-            key_rect.width() - 4.0,
-        );
-        let pos = key_rect.center() - galley.size() / 2.0;
+        match &labels[i] {
+            Some(label) => {
+                draw_remapped_label(&painter, &visuals, key_rect, unit, label);
+            }
+            None => {
+                let galley = painter.layout(
+                    keys::name(k.primary()),
+                    font.clone(),
+                    visuals.strong_text_color(),
+                    key_rect.width() - 4.0,
+                );
+                let pos = key_rect.center() - galley.size() / 2.0;
+                painter.galley(pos, galley, visuals.strong_text_color());
+            }
+        }
+    }
+}
+
+/// リマップ元のキーに、元の名前(表示するリマップのリマップ元の名前)を上に小さく、
+/// 変換先を下に大きく描く。
+///
+/// 幅が足りなければ変換先の文字を少し縮め、それでも足りなければ "→ " を省き、
+/// 最後は末尾を省略する。キーのほかのコードもリマップ元なら右上に印を描く。
+fn draw_remapped_label(
+    painter: &egui::Painter,
+    visuals: &egui::Visuals,
+    key_rect: egui::Rect,
+    unit: f32,
+    label: &KeyRemapLabel,
+) {
+    let marker = label.others > 0;
+    let name_width = keycap::name_max_width(key_rect, unit, marker);
+    let target_width = keycap::text_max_width(key_rect);
+    let (name_size, target_size) = keycap::two_line_sizes(unit);
+
+    let name = single_line(
+        painter,
+        label.source_name(),
+        name_size,
+        name_width,
+        visuals.text_color(),
+    );
+
+    let target = label.target_name();
+    let candidates = [format!("→ {target}"), target];
+    let widths: Vec<f32> = candidates
+        .iter()
+        .map(|t| {
+            painter
+                .layout_no_wrap(
+                    t.clone(),
+                    egui::FontId::proportional(target_size),
+                    visuals.strong_text_color(),
+                )
+                .size()
+                .x
+        })
+        .collect();
+    let (index, size) = keycap::choose_fit(&widths, target_size, target_width);
+    let target = single_line(
+        painter,
+        candidates[index].clone(),
+        size,
+        target_width,
+        visuals.strong_text_color(),
+    );
+
+    let (name_y, target_y) = keycap::stack_two(key_rect, name.size().y, target.size().y);
+    let cx = key_rect.center().x;
+    for (galley, y) in [(name, name_y), (target, target_y)] {
+        let pos = egui::pos2(cx - galley.size().x / 2.0, y - galley.size().y / 2.0);
         painter.galley(pos, galley, visuals.strong_text_color());
     }
+    if marker {
+        painter.circle_filled(
+            keycap::marker_center(key_rect, unit),
+            keycap::marker_radius(unit),
+            visuals.strong_text_color(),
+        );
+    }
+}
+
+/// 1 行に並べ、`max_width` を超える部分は末尾を "…" にして省く。
+fn single_line(
+    painter: &egui::Painter,
+    text: String,
+    size: f32,
+    max_width: f32,
+    color: egui::Color32,
+) -> Arc<egui::Galley> {
+    let mut job =
+        egui::text::LayoutJob::simple_singleline(text, egui::FontId::proportional(size), color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_width);
+    painter.layout_job(job)
 }
 
 /// 選択中のキーの名前と、持っているコード(名前・VK・テンキー由来か)、

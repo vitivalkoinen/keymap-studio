@@ -2,21 +2,110 @@
 //!
 //! キーコードはすべて [`keys::normalize`] を通してから比べる。
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use crate::config::{KeyCode, Remap};
 use crate::keys;
-use crate::layout::Layout;
+use crate::layout::{KeyDef, Layout};
 
-/// リマップ元になっている物理キーの添字(`layout.keys` の添字)。
+/// リマップ元のコード(正規化済み)ごとの変換先。
 ///
-/// キーが持つコードのどれか 1 つでもリマップ元なら含める。配列にないコードは無視する。
-pub fn remapped_keys(layout: &Layout, remaps: &[Remap]) -> HashSet<usize> {
-    remaps
+/// 同じリマップ元のエントリが複数あれば、変換先をファイルの順に並べる。複数キーの
+/// `originalKeys`(`"17;65"` など)は、含まれるコードそれぞれのリマップ元として扱う。
+/// エントリの並び順や `originalKeys` の表記・未知のフィールドは含めないので、
+/// 「リマップとしての意味」が同じなら等しくなる。
+pub type SourceMap = HashMap<KeyCode, Vec<Vec<KeyCode>>>;
+
+/// `remaps` から [`SourceMap`] を作る。
+pub fn source_map(remaps: &[Remap]) -> SourceMap {
+    let mut map = SourceMap::new();
+    for r in remaps {
+        let target = r.target();
+        for code in r.original() {
+            map.entry(keys::normalize(code))
+                .or_default()
+                .push(target.clone());
+        }
+    }
+    map
+}
+
+/// キーボード図での物理キーの状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyState {
+    /// どのコードもリマップ元でなく、保存済みの内容とも違わない
+    Plain,
+    /// リマップ元のコードがあり、保存済みの内容と同じ
+    Saved,
+    /// 保存済みの内容と違うコードがある(追加・変更・削除のいずれも)
+    Unsaved,
+}
+
+/// 物理キー `key` の状態。`saved` は最後に読み込んだか保存した時点、`current` は今の内容。
+pub fn key_state(key: &KeyDef, saved: &SourceMap, current: &SourceMap) -> KeyState {
+    if key.codes.iter().any(|c| saved.get(c) != current.get(c)) {
+        KeyState::Unsaved
+    } else if key.codes.iter().any(|c| current.contains_key(c)) {
+        KeyState::Saved
+    } else {
+        KeyState::Plain
+    }
+}
+
+/// 配列の全キーの状態(`layout.keys` と同じ順)。
+pub fn key_states(layout: &Layout, saved: &SourceMap, current: &SourceMap) -> Vec<KeyState> {
+    layout
+        .keys
         .iter()
-        .flat_map(|r| r.original())
-        .filter_map(|c| layout.find(c))
+        .map(|k| key_state(k, saved, current))
         .collect()
+}
+
+/// キーボード図のキーに併記する変換先。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRemapLabel {
+    /// 表示するリマップのリマップ元(キーの `codes` のうちのどれか)
+    pub source: KeyCode,
+    /// その変換先(同じリマップ元のエントリが複数あれば先頭のもの)
+    pub target: Vec<KeyCode>,
+    /// ほかにリマップ元になっているコードの数
+    pub others: usize,
+}
+
+impl KeyRemapLabel {
+    /// キーの上の行に出す名前。表示しているリマップのリマップ元の名前にする
+    /// (テンキーで主でないコードのリマップなら、主のコードではなくそのコードの名前)。
+    pub fn source_name(&self) -> String {
+        keys::name(self.source)
+    }
+
+    /// 下の行に出す変換先の名前。変換先が空か解析できないエントリなら "?"。
+    pub fn target_name(&self) -> String {
+        if self.target.is_empty() {
+            return "?".to_owned();
+        }
+        self.target
+            .iter()
+            .map(|&k| keys::name(k))
+            .collect::<Vec<_>>()
+            .join(" + ")
+    }
+}
+
+/// 物理キー `key` に併記する変換先。リマップ元のコードがなければ `None`。
+///
+/// 主のコードがリマップ元ならそれを、そうでなければ `codes` の順で最初のリマップ元を表示する。
+pub fn key_remap_label(key: &KeyDef, current: &SourceMap) -> Option<KeyRemapLabel> {
+    let mut remapped = key
+        .codes
+        .iter()
+        .filter_map(|c| current.get(c).and_then(|t| t.first()).map(|t| (*c, t)));
+    let (source, target) = remapped.next()?;
+    Some(KeyRemapLabel {
+        source,
+        target: target.clone(),
+        others: remapped.count(),
+    })
 }
 
 /// あるコードがリマップのどちら側に出てくるか。
@@ -125,20 +214,153 @@ mod tests {
     }
 
     #[test]
-    fn remapped_keys_marks_numpad_and_navigation_keys() {
+    fn key_states_mark_numpad_and_navigation_keys() {
         let layout = Layout::us_ansi();
-        let marked = remapped_keys(&layout, &remaps());
+        let map = source_map(&remaps());
+        let states = key_states(&layout, &map, &map);
         for vk in [
             0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6E,
         ] {
-            assert!(marked.contains(&key_with_primary(&layout, vk)), "{vk:#X}");
+            assert_eq!(
+                states[key_with_primary(&layout, vk)],
+                KeyState::Saved,
+                "{vk:#X}"
+            );
         }
         // "37" はナビゲーションクラスタの ←
-        assert!(marked.contains(&key_with_primary(&layout, 0x25)));
+        assert_eq!(states[key_with_primary(&layout, 0x25)], KeyState::Saved);
         // リマップ元でないキー
-        assert!(!marked.contains(&key_with_primary(&layout, 0x26)));
-        assert!(!marked.contains(&key_with_primary(&layout, 0x0D)));
-        assert_eq!(marked.len(), 12);
+        assert_eq!(states[key_with_primary(&layout, 0x26)], KeyState::Plain);
+        assert_eq!(states[key_with_primary(&layout, 0x0D)], KeyState::Plain);
+        assert_eq!(states.iter().filter(|&&s| s == KeyState::Saved).count(), 12);
+        assert!(!states.contains(&KeyState::Unsaved));
+    }
+
+    #[test]
+    fn source_map_normalizes_and_ignores_notation_and_order() {
+        let a: Vec<Remap> = serde_json::from_str(
+            r#"[{"originalKeys":"65","newRemapKeys":"66","x":1},
+                {"originalKeys":"2147483685","newRemapKeys":"100"}]"#,
+        )
+        .unwrap();
+        // 順序・未知のフィールド・フラグで意味の変わらない VK のフラグは比較に影響しない
+        let b: Vec<Remap> = serde_json::from_str(
+            r#"[{"originalKeys":"2147483685","newRemapKeys":"100"},
+                {"originalKeys":"2147483713","newRemapKeys":"66"}]"#,
+        )
+        .unwrap();
+        assert_eq!(source_map(&a), source_map(&b));
+        // フラグで別のキーになる VK は区別する
+        let c: Vec<Remap> =
+            serde_json::from_str(r#"[{"originalKeys":"37","newRemapKeys":"100"}]"#).unwrap();
+        assert!(!source_map(&c).contains_key(&KeyCode(2147483685)));
+        // 複数キーの originalKeys は含まれるコードそれぞれのリマップ元
+        let d: Vec<Remap> =
+            serde_json::from_str(r#"[{"originalKeys":"17;65","newRemapKeys":"66"}]"#).unwrap();
+        let map = source_map(&d);
+        assert_eq!(map[&KeyCode(17)], vec![vec![KeyCode(66)]]);
+        assert_eq!(map[&KeyCode(65)], vec![vec![KeyCode(66)]]);
+    }
+
+    #[test]
+    fn key_state_detects_added_changed_and_removed() {
+        use crate::edit;
+        let layout = Layout::us_ansi();
+        let saved_remaps = remaps();
+        let saved = source_map(&saved_remaps);
+        let state = |remaps: &[Remap], vk: u32| {
+            key_state(
+                &layout.keys[key_with_primary(&layout, vk)],
+                &saved,
+                &source_map(remaps),
+            )
+        };
+
+        // 追加
+        let mut r = saved_remaps.clone();
+        edit::set(&mut r, KeyCode(0x41), KeyCode(0x42));
+        assert_eq!(state(&r, 0x41), KeyState::Unsaved);
+        assert_eq!(state(&r, 0x64), KeyState::Saved);
+        // 変更(テンキーの 4 の、主でないコード)
+        let mut r = saved_remaps.clone();
+        edit::set(&mut r, KeyCode(2147483685), KeyCode(0x61));
+        assert_eq!(state(&r, 0x64), KeyState::Unsaved);
+        // 削除したキーも未保存
+        let mut r = saved_remaps.clone();
+        edit::remove(&mut r, KeyCode(37));
+        assert_eq!(state(&r, 0x25), KeyState::Unsaved);
+        assert_eq!(state(&r, 0x26), KeyState::Plain);
+        // 元に戻せば差はなくなる(削除して同じ内容を追加し直すと並び順だけ変わる)
+        edit::set(&mut r, KeyCode(37), KeyCode(256));
+        assert_eq!(state(&r, 0x25), KeyState::Saved);
+        assert_eq!(source_map(&r), saved);
+        // 重複したエントリを取り除くのは変更
+        let mut dup = saved_remaps.clone();
+        dup.push(saved_remaps[0].clone());
+        let saved_dup = source_map(&dup);
+        edit::set(&mut dup, KeyCode(2147483685), KeyCode(100));
+        assert_ne!(source_map(&dup), saved_dup);
+    }
+
+    #[test]
+    fn target_name_of_empty_or_unparsable_target_is_question_mark() {
+        let layout = Layout::us_ansi();
+        let key = &layout.keys[key_with_primary(&layout, 0x41)];
+        for new_keys in ["", "abc", ";"] {
+            let r = vec![Remap {
+                original_keys: "65".into(),
+                new_remap_keys: new_keys.into(),
+                extra: Default::default(),
+            }];
+            let label = key_remap_label(key, &source_map(&r)).unwrap();
+            assert_eq!(label.target_name(), "?", "{new_keys:?}");
+        }
+        let r: Vec<Remap> =
+            serde_json::from_str(r#"[{"originalKeys":"65","newRemapKeys":"17;66"}]"#).unwrap();
+        let label = key_remap_label(key, &source_map(&r)).unwrap();
+        assert_eq!(label.target_name(), "Ctrl + B");
+    }
+
+    #[test]
+    fn key_remap_label_prefers_primary_and_counts_others() {
+        let layout = Layout::us_ansi();
+        let key = |vk: u32| &layout.keys[key_with_primary(&layout, vk)];
+        let map = source_map(&remaps());
+        // テンキーの 4: 主のコード 0x64 はリマップ元でないので、0x80000025 を表示する
+        assert_eq!(
+            key_remap_label(key(0x64), &map),
+            Some(KeyRemapLabel {
+                source: KeyCode(2147483685),
+                target: vec![KeyCode(0x64)],
+                others: 0,
+            })
+        );
+        // 上の行はリマップ元のコードの名前(主のコードの "Num 4" ではない)
+        let label = key_remap_label(key(0x64), &map).unwrap();
+        assert_eq!(label.source_name(), "Num Left");
+        assert_eq!(
+            key_remap_label(key(0x65), &map).unwrap().source_name(),
+            "Clear"
+        );
+        assert_eq!(label.target_name(), "Num 4");
+        assert_eq!(key_remap_label(key(0x26), &map), None);
+
+        // 両方のコードがリマップ元なら主のコードを優先し、ほかの数を数える
+        let mut r = remaps();
+        crate::edit::set(&mut r, KeyCode(0x64), KeyCode(0x41));
+        let map = source_map(&r);
+        assert_eq!(
+            key_remap_label(key(0x64), &map),
+            Some(KeyRemapLabel {
+                source: KeyCode(0x64),
+                target: vec![KeyCode(0x41)],
+                others: 1,
+            })
+        );
+        assert_eq!(
+            key_remap_label(key(0x64), &map).unwrap().source_name(),
+            "Num 4"
+        );
     }
 
     #[test]
