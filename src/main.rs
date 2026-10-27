@@ -1318,8 +1318,17 @@ fn target_picker(
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .width(button.rect.width().max(220.0))
         .show(|ui| {
-            let field =
-                ui.add(egui::TextEdit::singleline(search).hint_text(tr(lang, Msg::SearchKeys)));
+            // TextEdit の内側の余白はテーマの `spacing.button_padding` から決まるが、メニューの
+            // ポップアップでは egui の `menu_style` がこれを (2, 0) に詰めるため、文字が枠に
+            // 重なって見える。ポップアップの外(全体のスタイル)の値を明示して標準の余白に戻す。
+            // 幅は一覧に合わせる(余白と枠を含めて利用できる幅に収まる)。
+            let margin = ui.ctx().global_style().spacing.button_padding;
+            let field = ui.add(
+                egui::TextEdit::singleline(search)
+                    .hint_text(tr(lang, Msg::SearchKeys))
+                    .margin(margin)
+                    .desired_width(f32::INFINITY),
+            );
             if opening {
                 field.request_focus();
             }
