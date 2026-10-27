@@ -68,6 +68,17 @@ pub fn remove(remaps: &mut Vec<Remap>, source: KeyCode) -> bool {
     remaps.len() != before
 }
 
+/// キーボード図で変換先を選ぶとき(SPEC.md §4.10)、`key_codes` のキーをクリックしたら
+/// `source` の変換先にするコード。選べないキーなら `None`。
+///
+/// `key_codes` はキーが持つコード(先頭が主のコード)。そのうち `choices`(リマップ先に
+/// 選べるコード。テンキー由来のフラグ付きは含まない)にある最初のものを使う。それが
+/// 自分自身へのリマップになるなら、ほかのコードには代えずに選べないものとする。
+pub fn pick_target(source: KeyCode, key_codes: &[KeyCode], choices: &[KeyCode]) -> Option<KeyCode> {
+    let target = key_codes.iter().copied().find(|c| choices.contains(c))?;
+    can_target(source, target).then_some(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +252,59 @@ mod tests {
         assert_eq!(list[0]["futureField"], "keep");
         assert_eq!(list[2]["originalKeys"], "65");
         assert_eq!(list[2]["newRemapKeys"], "66");
+    }
+
+    #[test]
+    fn pick_target_uses_primary_choosable_code() {
+        let choices = keys::target_choices();
+        let np = |vk: u32| KeyCode(vk | NUMPAD_ORIGIN_FLAG);
+        // 1 つのコードだけのキー
+        assert_eq!(
+            pick_target(KeyCode(0x41), &[KeyCode(0x42)], &choices),
+            Some(KeyCode(0x42))
+        );
+        // テンキーの 4: 主のコード(Num 4)を使う
+        let num4 = [KeyCode(0x64), np(0x25)];
+        assert_eq!(
+            pick_target(KeyCode(0x41), &num4, &choices),
+            Some(KeyCode(0x64))
+        );
+        // テンキー由来の Left をリマップ元にして、同じ物理キーの Num 4 を選べる
+        assert_eq!(pick_target(np(0x25), &num4, &choices), Some(KeyCode(0x64)));
+        // Num 4 自身へは選べない(ほかのコードに代えない)
+        assert_eq!(pick_target(KeyCode(0x64), &num4, &choices), None);
+        // フラグ付きのコードしかないキーは選べない
+        assert_eq!(pick_target(KeyCode(0x41), &[np(0x6F)], &choices), None);
+        // 主のコードが選べなければ次のコード
+        assert_eq!(
+            pick_target(KeyCode(0x41), &[np(0x0D), KeyCode(0x0D)], &choices),
+            Some(KeyCode(0x0D))
+        );
+        // 自分自身(正規化して同じ)
+        assert_eq!(pick_target(KeyCode(0x41), &[KeyCode(0x41)], &choices), None);
+        // 選べるコードがない(表にない VK、マウスボタン)
+        assert_eq!(pick_target(KeyCode(0x41), &[KeyCode(0xFF)], &choices), None);
+        assert_eq!(pick_target(KeyCode(0x41), &[KeyCode(0x01)], &choices), None);
+        assert_eq!(pick_target(KeyCode(0x41), &[], &choices), None);
+    }
+
+    #[test]
+    fn pick_target_on_us_layout() {
+        let choices = keys::target_choices();
+        let layout = crate::layout::Layout::us_ansi();
+        // US 配列のキーはすべて、自分自身以外のリマップ元に対して選べるか、選べない理由がある
+        for k in &layout.keys {
+            let picked = pick_target(KeyCode(0x100), &k.codes, &choices);
+            if let Some(p) = picked {
+                assert!(k.codes.contains(&p));
+                assert!(!p.is_numpad_origin());
+            } else {
+                assert!(
+                    k.codes.iter().all(|c| !choices.contains(c)),
+                    "{:?}",
+                    k.codes
+                );
+            }
+        }
     }
 }

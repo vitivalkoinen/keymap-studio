@@ -219,6 +219,90 @@ pub fn target_choices() -> Vec<KeyCode> {
         .collect()
 }
 
+/// リマップ先の一覧を分けるカテゴリ(SPEC.md §4.10)。並び順は一覧での表示順。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Category {
+    /// PowerToys 独自の値(Disable・Win)
+    Special,
+    Letters,
+    Digits,
+    /// 記号キー(US 配列の刻印)と OEM 102
+    Symbols,
+    /// F1–F24
+    Function,
+    /// Shift / Ctrl / Alt(左右を区別しないものとするもの)、左右の Win、Caps Lock
+    Modifiers,
+    /// Enter / Tab / Space / Backspace / Esc
+    Editing,
+    /// 矢印、Home / End / Page Up / Page Down、Insert / Delete
+    Navigation,
+    /// テンキー(Num 0–9、演算子、Divide、Clear、Num Lock)
+    Numpad,
+    /// メディア・ブラウザのキー、IME のキーなど、ほかのどれにも入らないもの
+    MediaAndOther,
+}
+
+impl Category {
+    /// 一覧での表示順。
+    pub const ALL: &[Category] = &[
+        Category::Special,
+        Category::Letters,
+        Category::Digits,
+        Category::Symbols,
+        Category::Function,
+        Category::Modifiers,
+        Category::Editing,
+        Category::Navigation,
+        Category::Numpad,
+        Category::MediaAndOther,
+    ];
+}
+
+/// キーコードのカテゴリ。テンキー由来のフラグ付きのコードはテンキーに入れる。
+pub fn category(code: KeyCode) -> Category {
+    let vk = code.vk();
+    if code.is_numpad_origin() && flag_dependent(vk).is_some() {
+        return Category::Numpad;
+    }
+    match vk {
+        0x100 | 0x104 => Category::Special,
+        0x41..=0x5A => Category::Letters,
+        0x30..=0x39 => Category::Digits,
+        0xBA..=0xC0 | 0xDB..=0xDF | 0xE2 => Category::Symbols,
+        0x70..=0x87 => Category::Function,
+        0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C | 0x14 => Category::Modifiers,
+        0x08 | 0x09 | 0x0D | 0x1B | 0x20 => Category::Editing,
+        0x21..=0x28 | 0x2D | 0x2E => Category::Navigation,
+        0x60..=0x6F | 0x0C | 0x90 => Category::Numpad,
+        _ => Category::MediaAndOther,
+    }
+}
+
+/// `choices` のうち、表示名に `query` を含むもの(大文字と小文字を区別しない。`query` の
+/// 前後の空白は無視する)をカテゴリごとに分ける。
+///
+/// カテゴリは [`Category::ALL`] の順、カテゴリの中は `choices` の順。該当するものが
+/// ないカテゴリは含めない。`query` が空(空白だけを含む)ならすべてを含める。
+pub fn group_choices(choices: &[KeyCode], query: &str) -> Vec<(Category, Vec<KeyCode>)> {
+    let query = query.trim().to_lowercase();
+    let matches: Vec<KeyCode> = choices
+        .iter()
+        .copied()
+        .filter(|&c| name(c).to_lowercase().contains(&query))
+        .collect();
+    Category::ALL
+        .iter()
+        .filter_map(|&cat| {
+            let codes: Vec<KeyCode> = matches
+                .iter()
+                .copied()
+                .filter(|&c| category(c) == cat)
+                .collect();
+            (!codes.is_empty()).then_some((cat, codes))
+        })
+        .collect()
+}
+
 /// 比較用にキーコードを正規化する。
 ///
 /// フラグで意味が変わらない既知の VK はフラグを落とす。フラグで意味が変わる VK と、
@@ -347,6 +431,112 @@ mod tests {
         for &c in &choices {
             assert!(lookup(c).is_some(), "{:#X}", c.0);
         }
+    }
+
+    #[test]
+    fn categories_of_representative_keys() {
+        use Category::*;
+        let cases = [
+            (KeyCode(0x100), Special),
+            (KeyCode(0x104), Special),
+            (KeyCode(0x41), Letters),
+            (KeyCode(0x5A), Letters),
+            (KeyCode(0x30), Digits),
+            (KeyCode(0x39), Digits),
+            (KeyCode(0xBA), Symbols),
+            (KeyCode(0xC0), Symbols),
+            (KeyCode(0xDC), Symbols),
+            (KeyCode(0xE2), Symbols),
+            (KeyCode(0x70), Function),
+            (KeyCode(0x87), Function),
+            (KeyCode(0x10), Modifiers),
+            (KeyCode(0xA5), Modifiers),
+            (KeyCode(0x5B), Modifiers),
+            (KeyCode(0x14), Modifiers),
+            (KeyCode(0x0D), Editing),
+            (KeyCode(0x20), Editing),
+            (KeyCode(0x1B), Editing),
+            (KeyCode(0x25), Navigation),
+            (KeyCode(0x21), Navigation),
+            (KeyCode(0x2E), Navigation),
+            (KeyCode(0x60), Numpad),
+            (KeyCode(0x6E), Numpad),
+            (KeyCode(0x6F), Numpad),
+            (KeyCode(0x0C), Numpad),
+            (KeyCode(0x90), Numpad),
+            (np(0x25), Numpad),
+            (np(0x0D), Numpad),
+            (KeyCode(0xAD), MediaAndOther),
+            (KeyCode(0xA6), MediaAndOther),
+            (KeyCode(0x15), MediaAndOther),
+            (KeyCode(0x2C), MediaAndOther),
+            (KeyCode(0x5D), MediaAndOther),
+        ];
+        for (code, cat) in cases {
+            assert_eq!(category(code), cat, "{}", name(code));
+        }
+    }
+
+    #[test]
+    fn every_choice_is_in_exactly_one_group() {
+        let choices = target_choices();
+        let groups = group_choices(&choices, "");
+        let total: usize = groups.iter().map(|(_, codes)| codes.len()).sum();
+        assert_eq!(total, choices.len());
+        // すべてのカテゴリに候補がある
+        let cats: Vec<Category> = groups.iter().map(|(c, _)| *c).collect();
+        assert_eq!(cats, Category::ALL);
+        for (cat, codes) in &groups {
+            assert!(codes.iter().all(|&c| category(c) == *cat));
+        }
+    }
+
+    #[test]
+    fn group_choices_filters_case_insensitively() {
+        let choices = target_choices();
+        let names = |groups: &[(Category, Vec<KeyCode>)]| -> Vec<(Category, Vec<String>)> {
+            groups
+                .iter()
+                .map(|(c, codes)| (*c, codes.iter().map(|&k| name(k)).collect()))
+                .collect()
+        };
+        // 見出しは該当するカテゴリだけ残る
+        assert_eq!(
+            names(&group_choices(&choices, "page")),
+            vec![(
+                Category::Navigation,
+                vec!["Page Up".to_owned(), "Page Down".to_owned()]
+            )]
+        );
+        let up = group_choices(&choices, "UP");
+        let cats: Vec<Category> = up.iter().map(|(c, _)| *c).collect();
+        assert_eq!(cats, vec![Category::Navigation, Category::MediaAndOther]);
+        assert!(names(&up)[0].1.contains(&"Up".to_owned()));
+        assert!(names(&up)[1].1.contains(&"Volume Up".to_owned()));
+        // 部分一致で、複数のカテゴリにまたがる
+        let win = group_choices(&choices, "win");
+        let cats: Vec<Category> = win.iter().map(|(c, _)| *c).collect();
+        assert_eq!(cats, vec![Category::Special, Category::Modifiers]);
+        // 該当なし
+        assert!(group_choices(&choices, "no such key").is_empty());
+    }
+
+    #[test]
+    fn group_choices_ignores_surrounding_whitespace() {
+        let choices = target_choices();
+        assert_eq!(
+            group_choices(&choices, "  page \t"),
+            group_choices(&choices, "page")
+        );
+        // 空白だけなら絞り込まない
+        assert_eq!(group_choices(&choices, "   "), group_choices(&choices, ""));
+        // 途中の空白は検索文字列の一部
+        let names: Vec<String> = group_choices(&choices, " page up ")
+            .into_iter()
+            .flat_map(|(_, codes)| codes)
+            .map(name)
+            .collect();
+        assert_eq!(names, vec!["Page Up"]);
     }
 
     #[test]

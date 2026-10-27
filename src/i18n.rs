@@ -84,6 +84,22 @@ pub enum Msg {
     PowerToysNotInstalled,
     KeyboardManagerNotConfigured,
     Recheck,
+    SearchKeys,
+    NoMatchingKeys,
+    PickOnKeyboard,
+    PickingOnKeyboard,
+    PickBanner,
+    PickBannerHint,
+    CategorySpecial,
+    CategoryLetters,
+    CategoryDigits,
+    CategorySymbols,
+    CategoryFunction,
+    CategoryModifiers,
+    CategoryEditing,
+    CategoryNavigation,
+    CategoryNumpad,
+    CategoryMediaAndOther,
 }
 
 impl Msg {
@@ -160,6 +176,22 @@ impl Msg {
         Msg::PowerToysNotInstalled,
         Msg::KeyboardManagerNotConfigured,
         Msg::Recheck,
+        Msg::SearchKeys,
+        Msg::NoMatchingKeys,
+        Msg::PickOnKeyboard,
+        Msg::PickingOnKeyboard,
+        Msg::PickBanner,
+        Msg::PickBannerHint,
+        Msg::CategorySpecial,
+        Msg::CategoryLetters,
+        Msg::CategoryDigits,
+        Msg::CategorySymbols,
+        Msg::CategoryFunction,
+        Msg::CategoryModifiers,
+        Msg::CategoryEditing,
+        Msg::CategoryNavigation,
+        Msg::CategoryNumpad,
+        Msg::CategoryMediaAndOther,
     ];
 }
 
@@ -280,6 +312,24 @@ fn en(msg: Msg) -> &'static str {
             "PowerToys Keyboard Manager settings were not found. Turn on Keyboard Manager once in the PowerToys settings, then press Check again."
         }
         Msg::Recheck => "Check again",
+        Msg::SearchKeys => "Search keys",
+        Msg::NoMatchingKeys => "No matching keys",
+        Msg::PickOnKeyboard => "Pick on keyboard",
+        Msg::PickingOnKeyboard => "Picking on the keyboard…",
+        Msg::PickBanner => "Click a key on the keyboard to choose the remap target for",
+        Msg::PickBannerHint => {
+            "Keys with a highlighted border can be chosen; dimmed keys cannot. Press Esc or Cancel to stop."
+        }
+        Msg::CategorySpecial => "Special (Disable, Win)",
+        Msg::CategoryLetters => "Letters",
+        Msg::CategoryDigits => "Digits",
+        Msg::CategorySymbols => "Symbols",
+        Msg::CategoryFunction => "Function keys",
+        Msg::CategoryModifiers => "Modifiers",
+        Msg::CategoryEditing => "Enter, Tab, Space, Backspace, Esc",
+        Msg::CategoryNavigation => "Navigation",
+        Msg::CategoryNumpad => "Numpad",
+        Msg::CategoryMediaAndOther => "Media and other",
     }
 }
 

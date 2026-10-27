@@ -221,7 +221,7 @@ impl Opened {
             path.display()
         ));
         Opened {
-            doc: Document::load(&path).map_err(LoadError::Failed),
+            doc: Document::load_logged(&path, log),
             path: Some(path),
             initial: InitialBackup::SkippedByArgument,
         }
@@ -263,7 +263,7 @@ impl Opened {
                 let initial =
                     InitialBackup::ensure(places.initial_backup_dir.as_deref(), &dir, log);
                 Opened {
-                    doc: Document::load(&definition).map_err(LoadError::Failed),
+                    doc: Document::load_logged(&definition, log),
                     path: Some(definition),
                     initial,
                 }
@@ -290,6 +290,14 @@ impl Document {
         })
     }
 
+    /// 読み込み、失敗したらログに残す。
+    fn load_logged(path: &Path, log: &Log) -> Result<Self, LoadError> {
+        Document::load(path).map_err(|e| {
+            log.write(&format!("load failed: {e}"));
+            LoadError::Failed(e)
+        })
+    }
+
     /// 今のキー→キーのリマップ。
     fn current(&self) -> SourceMap {
         matching::source_map(&self.config.remap_keys.in_process)
@@ -310,12 +318,14 @@ impl Document {
     }
 }
 
-/// キー→キーのリマップへの編集操作。
-enum Edit {
+/// 選択中のキーの欄での操作。
+enum Action {
     /// リマップ元を変換先へリマップする(追加または変更)
     Set(KeyCode, KeyCode),
     /// リマップ元のリマップを削除する
     Remove(KeyCode),
+    /// リマップ元の変換先をキーボード図で選び始める(§4.10)
+    StartPick(KeyCode),
 }
 
 /// 直前の保存・読み直しの結果。
@@ -428,6 +438,10 @@ struct App {
     selected: Option<usize>,
     /// リマップ先として選べるキーコード
     choices: Vec<KeyCode>,
+    /// リマップ先の一覧の検索欄に入力した文字列
+    target_search: String,
+    /// キーボード図で変換先を選んでいる間の、リマップ元のコード(§4.10)
+    picking: Option<KeyCode>,
     /// 引数でファイルを指定して起動した(PowerToys の状態の判定をしない)
     from_argument: bool,
     /// PowerToys の設定と本アプリのデータの場所
@@ -456,6 +470,8 @@ impl App {
             layout: Layout::us_ansi(),
             selected: None,
             choices: keys::target_choices(),
+            target_search: String::new(),
+            picking: None,
             from_argument,
             places,
             initial: opened.initial,
@@ -477,6 +493,7 @@ impl App {
         self.doc = opened.doc;
         self.initial = opened.initial;
         self.status = None;
+        self.picking = None;
     }
 
     /// 結果を `status` に入れ、ログに残す。
@@ -528,14 +545,20 @@ impl App {
             match (&opened.doc, &opened.path) {
                 // 同じファイルを読めなかったときは編集中の内容を残す
                 (Err(LoadError::Failed(e)), Some(p)) if self.path.as_ref() == Some(p) => {
-                    self.status = Some(Status::ReloadFailed(e.clone()));
+                    let e = e.clone();
                     self.initial = opened.initial;
+                    self.set_status("reload", Status::ReloadFailed(e));
                 }
                 _ => {
-                    self.status = opened.doc.is_ok().then_some(Status::Reloaded);
+                    let ok = opened.doc.is_ok();
                     self.path = opened.path;
                     self.doc = opened.doc;
                     self.initial = opened.initial;
+                    self.picking = None;
+                    self.status = None;
+                    if ok {
+                        self.set_status("reload", Status::Reloaded);
+                    }
                 }
             }
             return;
@@ -543,13 +566,15 @@ impl App {
         let Some(path) = &self.path else {
             return;
         };
-        self.status = Some(match Document::load(path) {
+        let status = match Document::load(path) {
             Ok(doc) => {
                 self.doc = Ok(doc);
+                self.picking = None;
                 Status::Reloaded
             }
             Err(e) => Status::ReloadFailed(e),
-        });
+        };
+        self.set_status("reload", status);
     }
 
     /// 導入前の設定に戻せるか。戻せなければ理由を返す。
@@ -606,6 +631,7 @@ impl App {
         let status = match Document::load(path) {
             Ok(doc) => {
                 self.doc = Ok(doc);
+                self.picking = None;
                 match signal {
                     Ok(()) => Status::Restored,
                     Err(e) => Status::RestoredNotApplied(e),
@@ -808,10 +834,33 @@ impl eframe::App for App {
                 Ok(doc) => doc,
             };
             let mut action = None;
+            // 変換先をキーボード図で選んでいる間は Esc で抜ける。Esc 1 回で 1 段だけ戻すため、
+            // リマップ先の一覧などのポップアップが開いていれば、そちらを閉じるだけにする
+            // (ポップアップはこのあと表示するときに Esc で閉じる)
+            if self.picking.is_some()
+                && self.dialog.is_none()
+                && !egui::Popup::is_any_open(ui.ctx())
+                && ui.input(|i| i.key_pressed(egui::Key::Escape))
+            {
+                self.picking = None;
+            }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading(tr(lang, Msg::KeyboardHeading));
                 let remaps = &doc.config.remap_keys.in_process;
                 let current = doc.current();
+                // 選択モードでは、キーごとにクリックしたら変換先になるコード(選べなければ None)
+                let picks: Option<Vec<Option<KeyCode>>> = self.picking.map(|source| {
+                    self.layout
+                        .keys
+                        .iter()
+                        .map(|k| edit::pick_target(source, &k.codes, &self.choices))
+                        .collect()
+                });
+                if let Some(source) = self.picking
+                    && pick_banner(ui, lang, source)
+                {
+                    self.picking = None;
+                }
                 let states = matching::key_states(&self.layout, &doc.saved, &current);
                 let labels: Vec<_> = self
                     .layout
@@ -824,14 +873,24 @@ impl eframe::App for App {
                 egui::ScrollArea::horizontal()
                     .id_salt("keyboard")
                     .show(ui, |ui| {
-                        keyboard(
+                        let clicked = keyboard(
                             ui,
                             width,
                             &self.layout,
                             &states,
                             &labels,
-                            &mut self.selected,
+                            self.selected,
+                            picks.as_deref(),
                         );
+                        match (clicked, self.picking, &picks) {
+                            (Some(i), Some(source), Some(picks)) => {
+                                if let Some(target) = picks[i] {
+                                    action = Some(Action::Set(source, target));
+                                }
+                            }
+                            (Some(i), None, _) => self.selected = Some(i),
+                            _ => {}
+                        }
                     });
                 legend(ui, lang);
                 ui.separator();
@@ -843,7 +902,14 @@ impl eframe::App for App {
                     }
                     Some(i) => {
                         let codes = &self.layout.keys[i].codes;
-                        action = key_details(ui, lang, codes, remaps, &self.choices);
+                        let picker = TargetPicker {
+                            choices: &self.choices,
+                            search: &mut self.target_search,
+                            picking: self.picking,
+                        };
+                        if let Some(a) = key_details(ui, lang, codes, remaps, picker) {
+                            action = Some(a);
+                        }
                     }
                 }
                 ui.separator();
@@ -862,9 +928,15 @@ impl eframe::App for App {
             if let Some(action) = action {
                 let remaps = &mut doc.config.remap_keys.in_process;
                 let changed = match action {
-                    Edit::Set(source, target) => edit::set(remaps, source, target),
-                    Edit::Remove(source) => edit::remove(remaps, source),
+                    Action::Set(source, target) => edit::set(remaps, source, target),
+                    Action::Remove(source) => edit::remove(remaps, source),
+                    Action::StartPick(source) => {
+                        self.picking = Some(source);
+                        return;
+                    }
                 };
+                // 編集したら選択モードを抜ける
+                self.picking = None;
                 if changed {
                     self.status = None;
                 }
@@ -909,19 +981,25 @@ fn legend(ui: &mut egui::Ui, lang: Lang) {
     });
 }
 
-/// キーボード図を描き、クリックされたキーの添字を `selected` に入れる。
+/// キーボード図を描き、クリックされたキーの添字を返す。
 ///
 /// `width` は図に使える幅。キーの大きさはこれに合わせるが、下限より狭いときは
 /// 図がはみ出す(呼び出し側の横スクロールで見る)。`states` と `labels` は
-/// `layout.keys` と同じ順の、各キーの状態と併記する変換先。
+/// `layout.keys` と同じ順の、各キーの状態と併記する変換先。`selected` は選択中のキー。
+///
+/// `picks` は変換先をキーボード図で選んでいる間だけ渡す、`layout.keys` と同じ順の
+/// 「クリックしたら変換先になるコード」。選べるキーは選択の色の枠で囲み、選べないキーは
+/// 薄くして、クリックしても返さない。
 fn keyboard(
     ui: &mut egui::Ui,
     width: f32,
     layout: &Layout,
     states: &[KeyState],
     labels: &[Option<KeyRemapLabel>],
-    selected: &mut Option<usize>,
-) {
+    selected: Option<usize>,
+    picks: Option<&[Option<KeyCode>]>,
+) -> Option<usize> {
+    let mut clicked = None;
     let (w, h) = layout.size();
     // 1u の大きさ。幅に合わせて伸縮させるが、極端に小さく・大きくはしない。
     let unit = (width / w).clamp(keycap::MIN_UNIT, keycap::MAX_UNIT);
@@ -936,24 +1014,32 @@ fn keyboard(
             egui::vec2(k.w * unit, k.h * unit),
         )
         .shrink(keycap::KEY_GAP);
-        let response = ui.interact(
-            key_rect,
-            ui.scope_id().with(("key", i)),
-            egui::Sense::click(),
-        );
+        // 選択モードで選べないキーは、クリックもホバーも受け付けない
+        let pickable = picks.map(|p| p[i].is_some());
+        let sense = if pickable == Some(false) {
+            egui::Sense::hover()
+        } else {
+            egui::Sense::click()
+        };
+        let response = ui.interact(key_rect, ui.scope_id().with(("key", i)), sense);
+        let hovered = response.hovered() && pickable != Some(false);
         if response.clicked() {
-            *selected = Some(i);
+            clicked = Some(i);
         }
 
-        let fill =
-            keycap::state_fill(states[i], visuals.dark_mode).unwrap_or(if response.hovered() {
-                visuals.widgets.hovered.weak_bg_fill
-            } else {
-                visuals.widgets.inactive.weak_bg_fill
-            });
-        let stroke = if *selected == Some(i) {
+        let fill = keycap::state_fill(states[i], visuals.dark_mode).unwrap_or(if hovered {
+            visuals.widgets.hovered.weak_bg_fill
+        } else {
+            visuals.widgets.inactive.weak_bg_fill
+        });
+        let stroke = if pickable == Some(true) {
+            egui::Stroke::new(
+                if hovered { 3.0 } else { 2.0 },
+                visuals.selection.stroke.color,
+            )
+        } else if selected == Some(i) {
             egui::Stroke::new(2.5, visuals.strong_text_color())
-        } else if response.hovered() {
+        } else if hovered {
             visuals.widgets.hovered.bg_stroke
         } else {
             visuals.widgets.inactive.bg_stroke
@@ -975,7 +1061,41 @@ fn keyboard(
                 painter.galley(pos, galley, visuals.strong_text_color());
             }
         }
+        if pickable == Some(false) {
+            // 背景の色を半透明に重ねて薄くする
+            painter.rect_filled(key_rect, 3.0, visuals.panel_fill.gamma_multiply(0.75));
+            // 選択中のキー(選択元)の枠は薄くせずに描き直す
+            if selected == Some(i) {
+                painter.rect_stroke(key_rect, 3.0, stroke, egui::StrokeKind::Inside);
+            }
+        }
     }
+    clicked
+}
+
+/// 変換先をキーボード図で選んでいることを示す帯。どのリマップ元のコードについての選択かと、
+/// 抜け方を示す。取り消しのボタンが押されたら `true`。
+fn pick_banner(ui: &mut egui::Ui, lang: Lang, source: KeyCode) -> bool {
+    let mut cancel = false;
+    let visuals = ui.visuals().clone();
+    egui::Frame::new()
+        .fill(visuals.selection.bg_fill.gamma_multiply(0.35))
+        .stroke(visuals.selection.stroke)
+        .corner_radius(4.0)
+        .inner_margin(8.0)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!(
+                    "{}: {} ({})",
+                    tr(lang, Msg::PickBanner),
+                    keys::name(source),
+                    keys::format_hex(source)
+                ));
+                cancel = ui.button(tr(lang, Msg::Cancel)).clicked();
+            });
+            ui.label(tr(lang, Msg::PickBannerHint));
+        });
+    cancel
 }
 
 /// リマップ元のキーに、元の名前(表示するリマップのリマップ元の名前)を上に小さく、
@@ -1059,15 +1179,15 @@ fn single_line(
 /// 選択中のキーの名前と、持っているコード(名前・VK・テンキー由来か)、
 /// それぞれに関係するリマップを表示する。`codes` は先頭が主のコード。
 ///
-/// コードごとにリマップ先を選ぶ欄と削除のボタンを置き、操作されたらその編集を返す。
-/// `choices` はリマップ先として選べるキーコード。
+/// コードごとにリマップ先を選ぶ欄([`target_picker`])、キーボード図で選ぶボタン、削除のボタンを
+/// 置き、操作されたらそれを返す。
 fn key_details(
     ui: &mut egui::Ui,
     lang: Lang,
     codes: &[KeyCode],
     remaps: &[Remap],
-    choices: &[KeyCode],
-) -> Option<Edit> {
+    picker: TargetPicker<'_>,
+) -> Option<Action> {
     let mut action = None;
     ui.label(format!(
         "{}: {}",
@@ -1097,20 +1217,30 @@ fn key_details(
                     Some(target) => format_keys(target),
                     None => tr(lang, Msg::NotRemapped).to_owned(),
                 };
-                egui::ComboBox::from_id_salt(("remap_target", code.0))
-                    .selected_text(text)
-                    .height(320.0)
-                    .show_ui(ui, |ui| {
-                        for &c in choices.iter().filter(|&&c| edit::can_target(code, c)) {
-                            let checked = current.as_deref() == Some(&[c][..]);
-                            if ui.selectable_label(checked, keys::name(c)).clicked() {
-                                action = Some(Edit::Set(code, c));
-                            }
-                        }
-                    });
-                if current.is_some() && ui.button(tr(lang, Msg::RemoveRemap)).clicked() {
-                    action = Some(Edit::Remove(code));
+                if let Some(target) = target_picker(
+                    ui,
+                    lang,
+                    code,
+                    current.as_deref(),
+                    text,
+                    picker.choices,
+                    picker.search,
+                ) {
+                    action = Some(Action::Set(code, target));
                 }
+                ui.horizontal(|ui| {
+                    if picker.picking == Some(code) {
+                        ui.colored_label(
+                            ui.visuals().selection.stroke.color,
+                            tr(lang, Msg::PickingOnKeyboard),
+                        );
+                    } else if ui.button(tr(lang, Msg::PickOnKeyboard)).clicked() {
+                        action = Some(Action::StartPick(code));
+                    }
+                    if current.is_some() && ui.button(tr(lang, Msg::RemoveRemap)).clicked() {
+                        action = Some(Action::Remove(code));
+                    }
+                });
                 ui.end_row();
             }
         });
@@ -1149,6 +1279,97 @@ fn signal_detail(lang: Lang, e: &save::SignalError) -> String {
 /// `path` のファイル名が `name` か。
 fn is_definition_file(path: &Path, name: &str) -> bool {
     path.file_name().is_some_and(|n| n == name)
+}
+
+/// リマップ先の一覧に渡す状態。
+struct TargetPicker<'a> {
+    /// リマップ先として選べるキーコード
+    choices: &'a [KeyCode],
+    /// 検索欄の文字列(一覧を開くたびに空にする)
+    search: &'a mut String,
+    /// キーボード図で変換先を選んでいるリマップ元のコード
+    picking: Option<KeyCode>,
+}
+
+/// リマップ先を選ぶボタンと、押すと開く一覧(§4.10)。選ばれたコードを返す。
+///
+/// 一覧の上に検索欄を置き(開いたときにフォーカスを当てる)、表示名の一部で絞り込む。
+/// 一覧はカテゴリの見出しで区切る。自分自身へのリマップになるものは出さない。
+/// egui の ComboBox は一覧全体をスクロールの中に置くため、検索欄が流れないよう
+/// ボタンと [`egui::Popup`] で作る。
+fn target_picker(
+    ui: &mut egui::Ui,
+    lang: Lang,
+    source: KeyCode,
+    current: Option<&[KeyCode]>,
+    text: String,
+    choices: &[KeyCode],
+    search: &mut String,
+) -> Option<KeyCode> {
+    let button = ui.add(egui::Button::new(text).min_size(egui::vec2(160.0, 0.0)));
+    let popup_id = ui.make_persistent_id(("remap_target", source.0));
+    let opening = button.clicked() && !egui::Popup::is_id_open(ui.ctx(), popup_id);
+    if opening {
+        search.clear();
+    }
+    let mut picked = None;
+    egui::Popup::menu(&button)
+        .id(popup_id)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .width(button.rect.width().max(220.0))
+        .show(|ui| {
+            let field =
+                ui.add(egui::TextEdit::singleline(search).hint_text(tr(lang, Msg::SearchKeys)));
+            if opening {
+                field.request_focus();
+            }
+            ui.separator();
+            let allowed: Vec<KeyCode> = choices
+                .iter()
+                .copied()
+                .filter(|&c| edit::can_target(source, c))
+                .collect();
+            let groups = keys::group_choices(&allowed, search);
+            egui::ScrollArea::vertical()
+                .id_salt("remap_target_list")
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    if groups.is_empty() {
+                        ui.weak(tr(lang, Msg::NoMatchingKeys));
+                    }
+                    for (category, codes) in groups {
+                        ui.add_space(4.0);
+                        ui.strong(tr(lang, category_msg(category)));
+                        for c in codes {
+                            let checked = current == Some(&[c][..]);
+                            if ui.selectable_label(checked, keys::name(c)).clicked() {
+                                picked = Some(c);
+                            }
+                        }
+                    }
+                });
+        });
+    if picked.is_some() {
+        egui::Popup::close_id(ui.ctx(), popup_id);
+    }
+    picked
+}
+
+/// カテゴリの見出しの文字列。
+fn category_msg(category: keys::Category) -> Msg {
+    use keys::Category::*;
+    match category {
+        Special => Msg::CategorySpecial,
+        Letters => Msg::CategoryLetters,
+        Digits => Msg::CategoryDigits,
+        Symbols => Msg::CategorySymbols,
+        Function => Msg::CategoryFunction,
+        Modifiers => Msg::CategoryModifiers,
+        Editing => Msg::CategoryEditing,
+        Navigation => Msg::CategoryNavigation,
+        Numpad => Msg::CategoryNumpad,
+        MediaAndOther => Msg::CategoryMediaAndOther,
+    }
 }
 
 fn format_keys(keys: &[KeyCode]) -> String {
@@ -1328,6 +1549,52 @@ mod tests {
         app.reload();
         assert!(matches!(app.status, Some(Status::ReloadFailed(_))));
         assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn load_failures_are_logged() {
+        let env = Env::new();
+        // 引数で指定したファイルが解析できない
+        let path = env.tmp.path().join("broken.json");
+        fs::write(&path, "broken").unwrap();
+        let app = env.app(Some(path));
+        assert!(matches!(app.doc, Err(LoadError::Failed(_))));
+        assert!(env.log_text().contains("load failed: "));
+
+        // PowerToys のフォルダの定義ファイルが解析できない
+        env.install();
+        fs::write(env.km().join("default.json"), "broken").unwrap();
+        let app = env.app(None);
+        assert!(matches!(app.doc, Err(LoadError::Failed(_))));
+        assert_eq!(env.log_text().matches("load failed: ").count(), 2);
+    }
+
+    #[test]
+    fn reload_results_are_logged_and_end_picking() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        app.picking = Some(KeyCode(0x41));
+        app.reload();
+        assert!(matches!(app.status, Some(Status::Reloaded)));
+        assert_eq!(app.picking, None);
+        assert!(env.log_text().contains("reload: Reloaded"));
+
+        fs::write(env.km().join("default.json"), "broken").unwrap();
+        app.reload();
+        assert!(matches!(app.status, Some(Status::ReloadFailed(_))));
+        assert!(env.log_text().contains("reload: Failed to reload"));
+
+        // 引数で指定したファイルでも残す
+        let path = env.tmp.path().join("arg.json");
+        fs::write(&path, DEFAULT_JSON).unwrap();
+        let mut app = env.app(Some(path.clone()));
+        app.reload();
+        fs::write(&path, "broken").unwrap();
+        app.reload();
+        let log = env.log_text();
+        assert_eq!(log.matches("reload: Reloaded").count(), 2, "{log}");
+        assert_eq!(log.matches("reload: Failed to reload").count(), 2, "{log}");
     }
 
     #[test]
