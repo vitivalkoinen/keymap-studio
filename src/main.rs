@@ -1339,13 +1339,16 @@ fn target_picker(
                     }
                     for (category, codes) in groups {
                         ui.add_space(4.0);
-                        ui.strong(tr(lang, category_msg(category)));
-                        for c in codes {
-                            let checked = current == Some(&[c][..]);
-                            if ui.selectable_label(checked, keys::name(c)).clicked() {
-                                picked = Some(c);
+                        category_header(ui, tr(lang, category_msg(category)));
+                        // キーの項目は見出しより字下げする
+                        ui.indent(("remap_target_group", category), |ui| {
+                            for c in codes {
+                                let checked = current == Some(&[c][..]);
+                                if ui.selectable_label(checked, keys::name(c)).clicked() {
+                                    picked = Some(c);
+                                }
                             }
-                        }
+                        });
                     }
                 });
         });
@@ -1353,6 +1356,45 @@ fn target_picker(
         egui::Popup::close_id(ui.ctx(), popup_id);
     }
     picked
+}
+
+/// リマップ先の一覧のカテゴリの見出し(§4.10)。一覧の幅いっぱいの帯に、小さめの文字で書く。
+///
+/// 選択肢の一つに見えないよう、ボタンや `SelectableLabel` ではなく painter で描く。
+/// `Sense::hover()` で場所を取るだけなので、クリックやホバーに反応せず、キーボード操作の
+/// フォーカスも止まらない。
+fn category_header(ui: &mut egui::Ui, text: &str) {
+    let visuals = ui.visuals();
+    let fill = category_header_fill(visuals.dark_mode);
+    let color = visuals.strong_text_color();
+    let body = egui::TextStyle::Body.resolve(ui.style()).size;
+    let font = egui::FontId::proportional((body * 0.85).round());
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
+    let padding = egui::vec2(6.0, 3.0);
+    let size = egui::vec2(ui.available_width(), galley.size().y + padding.y * 2.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, fill);
+    let pos = egui::pos2(
+        rect.left() + padding.x,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    // egui の既定のフォントには太字の書体がないため、横に少しずらして重ねて太く見せる
+    painter.galley(pos, galley.clone(), color);
+    painter.galley(pos + egui::vec2(0.6, 0.0), galley, color);
+}
+
+/// カテゴリの見出しの帯の色。
+///
+/// 一覧の背景(ポップアップの `window_fill`)・ホバーした項目(`widgets.hovered`)・選択した項目
+/// (`selection`、青系)のどれとも区別でき、`strong_text_color` の文字が読める無彩色にする。
+/// ダークでは背景より暗く、ライトではホバーより暗くする。
+fn category_header_fill(dark_mode: bool) -> egui::Color32 {
+    if dark_mode {
+        egui::Color32::from_gray(12)
+    } else {
+        egui::Color32::from_gray(190)
+    }
 }
 
 /// カテゴリの見出しの文字列。
@@ -1444,6 +1486,44 @@ mod tests {
             KeyCode(0x43),
         );
         assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn category_header_fill_is_distinct_and_readable() {
+        // 無彩色の明るさ(r = g = b でないものは平均)
+        fn level(c: egui::Color32) -> i32 {
+            (i32::from(c.r()) + i32::from(c.g()) + i32::from(c.b())) / 3
+        }
+        for visuals in [egui::Visuals::dark(), egui::Visuals::light()] {
+            let fill = category_header_fill(visuals.dark_mode);
+            let theme = if visuals.dark_mode { "dark" } else { "light" };
+            assert_eq!(fill.r(), fill.g(), "{theme}");
+            assert_eq!(fill.g(), fill.b(), "{theme}");
+            // 一覧の背景と区別できる
+            assert!(
+                (level(fill) - level(visuals.window_fill)).abs() >= 15,
+                "{theme}"
+            );
+            // ホバーした項目と区別できる
+            for hover in [
+                visuals.widgets.hovered.weak_bg_fill,
+                visuals.widgets.hovered.bg_fill,
+            ] {
+                assert!((level(fill) - level(hover)).abs() >= 25, "{theme}");
+            }
+            // 選択した項目(青系)は色みで区別できる
+            let sel = visuals.selection.bg_fill;
+            assert_ne!((sel.r(), sel.g(), sel.b()), (fill.r(), fill.g(), fill.b()));
+            assert!(
+                sel.b() > sel.r(),
+                "{theme}: selection is expected to be bluish"
+            );
+            // 文字が読める
+            assert!(
+                (level(fill) - level(visuals.strong_text_color())).abs() >= 150,
+                "{theme}"
+            );
+        }
     }
 
     #[test]
