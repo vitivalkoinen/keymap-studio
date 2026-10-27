@@ -30,6 +30,32 @@ pub enum Msg {
     RemappedFrom,
     NoRemapsForKey,
     KeyRemapsHeading,
+    RemapTo,
+    NotRemapped,
+    RemoveRemap,
+    Save,
+    UnsavedChanges,
+    NoUnsavedChanges,
+    Saved,
+    SavedNotApplied,
+    SignalUnsupported,
+    SaveAbortedModified,
+    SaveAbortedLocked,
+    SaveFailedRead,
+    SaveFailedBackup,
+    SaveFailedWrite,
+    BackupDirNotFound,
+    UnsafeActiveConfiguration,
+    Reload,
+    Reloaded,
+    ReloadFailed,
+    ReloadConfirm,
+    DiscardAndReload,
+    CloseConfirm,
+    DontSave,
+    Cancel,
+    SignalEventNotFound,
+    SettingsLoadFailed,
 }
 
 impl Msg {
@@ -52,6 +78,32 @@ impl Msg {
         Msg::RemappedFrom,
         Msg::NoRemapsForKey,
         Msg::KeyRemapsHeading,
+        Msg::RemapTo,
+        Msg::NotRemapped,
+        Msg::RemoveRemap,
+        Msg::Save,
+        Msg::UnsavedChanges,
+        Msg::NoUnsavedChanges,
+        Msg::Saved,
+        Msg::SavedNotApplied,
+        Msg::SignalUnsupported,
+        Msg::SaveAbortedModified,
+        Msg::SaveAbortedLocked,
+        Msg::SaveFailedRead,
+        Msg::SaveFailedBackup,
+        Msg::SaveFailedWrite,
+        Msg::BackupDirNotFound,
+        Msg::UnsafeActiveConfiguration,
+        Msg::Reload,
+        Msg::Reloaded,
+        Msg::ReloadFailed,
+        Msg::ReloadConfirm,
+        Msg::DiscardAndReload,
+        Msg::CloseConfirm,
+        Msg::DontSave,
+        Msg::Cancel,
+        Msg::SignalEventNotFound,
+        Msg::SettingsLoadFailed,
     ];
 }
 
@@ -80,6 +132,40 @@ fn en(msg: Msg) -> &'static str {
         Msg::RemappedFrom => "Remapped from",
         Msg::NoRemapsForKey => "No remaps for this key.",
         Msg::KeyRemapsHeading => "Key remaps",
+        Msg::RemapTo => "Remap to",
+        Msg::NotRemapped => "(not remapped)",
+        Msg::RemoveRemap => "Remove",
+        Msg::Save => "Save",
+        Msg::UnsavedChanges => "Unsaved changes",
+        Msg::NoUnsavedChanges => "No unsaved changes",
+        Msg::Saved => "Saved.",
+        Msg::SavedNotApplied => {
+            "Saved, but PowerToys may not have applied the changes (turn Keyboard Manager off and on in PowerToys to apply them)"
+        }
+        Msg::SignalUnsupported => "notifying PowerToys is only supported on Windows",
+        Msg::SaveAbortedModified => {
+            "Not saved: the file was changed by another program after it was loaded."
+        }
+        Msg::SaveAbortedLocked => "Not saved: the file is locked by another program (timed out)",
+        Msg::SaveFailedRead => "Not saved: failed to read the current file",
+        Msg::SaveFailedBackup => "Not saved: failed to create a backup",
+        Msg::SaveFailedWrite => "Failed to save",
+        Msg::BackupDirNotFound => {
+            "Not saved: the backup folder (next to the executable) could not be determined."
+        }
+        Msg::UnsafeActiveConfiguration => {
+            "Not loaded: activeConfiguration in settings.json is not a safe file name"
+        }
+        Msg::Reload => "Reload",
+        Msg::Reloaded => "Reloaded the file.",
+        Msg::ReloadFailed => "Failed to reload the file",
+        Msg::ReloadConfirm => "Unsaved changes will be discarded. Reload the file?",
+        Msg::DiscardAndReload => "Discard and reload",
+        Msg::CloseConfirm => "You have unsaved changes. Save them before closing?",
+        Msg::DontSave => "Don't save",
+        Msg::Cancel => "Cancel",
+        Msg::SignalEventNotFound => "PowerToys Keyboard Manager does not seem to be running",
+        Msg::SettingsLoadFailed => "Not loaded: failed to read settings.json",
     }
 }
 

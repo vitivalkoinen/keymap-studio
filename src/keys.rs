@@ -1,7 +1,7 @@
 //! 仮想キーコード(VK)と表示名の対応。
 //!
 //! 最上位ビットは PowerToys の「テンキー由来」フラグ([`NUMPAD_ORIGIN_FLAG`])。
-//! フラグの有無で指すキーが変わる VK(ナビゲーション系と Enter)は [`FLAG_DEPENDENT`] で
+//! フラグの有無で指すキーが変わる VK(ナビゲーション系と Enter、Divide)は [`FLAG_DEPENDENT`] で
 //! 区別する。それ以外の VK はフラグを無視して同じキーとみなす。
 //! 表示名はローカライズの対象外で、常に英語。
 //!
@@ -13,8 +13,13 @@ use crate::config::KeyCode;
 ///
 /// フラグなしはナビゲーションクラスタ(とメインの Enter)、フラグありは
 /// NumLock オフ時のテンキー(とテンキーの Enter)。
+///
+/// Enter と Divide は、エンジンが Windows の拡張キーであるとき(= テンキー)にフラグを付ける
+/// (PowerToys の `EncodeKeyNumpadOrigin`)。そのためテンキーの / は常にフラグ付きの 0x6F で届き、
+/// フラグなしの 0x6F(VK_DIVIDE)は通常のキーボードからは出ない。
 const FLAG_DEPENDENT: &[(u32, &str, &str)] = &[
     (0x0D, "Enter", "Num Enter"),
+    (0x6F, "Divide", "Num /"),
     (0x21, "Page Up", "Num Page Up"),
     (0x22, "Page Down", "Num Page Down"),
     (0x23, "End", "Num End"),
@@ -28,8 +33,6 @@ const FLAG_DEPENDENT: &[(u32, &str, &str)] = &[
 ];
 
 /// テンキー由来フラグに関係なく同じキーを指す VK と表示名。
-///
-/// テンキーの /(0x6F)はフラグが付きうるが、どちらでもテンキーの / なのでここに置く。
 const NAMES: &[(u32, &str)] = &[
     // マウスボタン
     (0x01, "Left Button"),
@@ -113,7 +116,6 @@ const NAMES: &[(u32, &str)] = &[
     (0x6C, "Num Separator"),
     (0x6D, "Num -"),
     (0x6E, "Num ."),
-    (0x6F, "Num /"),
     // ファンクションキー
     (0x70, "F1"),
     (0x71, "F2"),
@@ -197,6 +199,26 @@ fn plain_name(vk: u32) -> Option<&'static str> {
     NAMES.iter().find(|(v, _)| *v == vk).map(|(_, name)| *name)
 }
 
+/// リマップ先として選べるキーコード。先頭は "Disable"(0x100)で、残りは表の順
+/// (フラグに関係しない VK の後に、フラグで別のキーになる VK)。
+///
+/// 表にあるキーのうちマウスボタンは除く。テンキー由来フラグ付きのコードは含めない
+/// (リマップ先にフラグを付けたときのエンジンの動作を確認していないため。SPEC.md §4.1)。
+pub fn target_choices() -> Vec<KeyCode> {
+    const MOUSE_BUTTONS: &[u32] = &[0x01, 0x02, 0x04, 0x05, 0x06];
+    const DISABLED: u32 = 0x100;
+    let plain = NAMES
+        .iter()
+        .map(|(vk, _)| *vk)
+        .filter(|vk| !MOUSE_BUTTONS.contains(vk) && *vk != DISABLED);
+    let flag_dependent = FLAG_DEPENDENT.iter().map(|(vk, _, _)| *vk);
+    std::iter::once(DISABLED)
+        .chain(plain)
+        .chain(flag_dependent)
+        .map(KeyCode)
+        .collect()
+}
+
 /// 比較用にキーコードを正規化する。
 ///
 /// フラグで意味が変わらない既知の VK はフラグを落とす。フラグで意味が変わる VK と、
@@ -271,13 +293,20 @@ mod tests {
     }
 
     #[test]
+    fn distinguishes_numpad_divide() {
+        // テンキーの / は常にフラグ付きで届くので、フラグなしとは別のキーとして扱う
+        assert_eq!(name(np(0x6F)), "Num /");
+        assert_eq!(name(KeyCode(0x6F)), "Divide");
+        assert_eq!(normalize(np(0x6F)), np(0x6F));
+        assert_eq!(normalize(KeyCode(0x6F)), KeyCode(0x6F));
+    }
+
+    #[test]
     fn flag_independent_keys_ignore_flag() {
         assert_eq!(name(KeyCode(0xA3)), "Right Ctrl");
         assert_eq!(name(KeyCode(0xA5)), "Right Alt");
-        assert_eq!(name(KeyCode(0x6F)), "Num /");
-        assert_eq!(name(np(0x6F)), "Num /");
         assert_eq!(name(KeyCode(0x41)), "A");
-        assert_eq!(normalize(np(0x6F)), KeyCode(0x6F));
+        assert_eq!(normalize(np(0x41)), KeyCode(0x41));
         assert_eq!(normalize(np(0x5B)), KeyCode(0x5B));
         assert_eq!(normalize(np(0x25)), np(0x25));
         assert_eq!(normalize(KeyCode(0x25)), KeyCode(0x25));
@@ -298,6 +327,26 @@ mod tests {
         assert_eq!(name(KeyCode(0x1FF)), "VK 0x1FF");
         // 表にない VK はフラグを残す
         assert_eq!(normalize(np(0xFF)), np(0xFF));
+    }
+
+    #[test]
+    fn target_choices_exclude_numpad_origin_codes() {
+        let choices = target_choices();
+        assert_eq!(choices[0], KeyCode(0x100));
+        assert!(choices.contains(&KeyCode(0x25)));
+        assert!(choices.contains(&KeyCode(0x0D)));
+        assert!(!choices.contains(&np(0x25)));
+        assert!(!choices.contains(&np(0x0D)));
+        assert!(!choices.contains(&np(0x6F)));
+        assert!(choices.iter().all(|c| !c.is_numpad_origin()));
+        assert!(choices.contains(&KeyCode(0x64)));
+        assert!(choices.contains(&KeyCode(0x104)));
+        assert!(!choices.contains(&KeyCode(0x01)));
+        let unique: std::collections::HashSet<_> = choices.iter().collect();
+        assert_eq!(unique.len(), choices.len());
+        for &c in &choices {
+            assert!(lookup(c).is_some(), "{:#X}", c.0);
+        }
     }
 
     #[test]

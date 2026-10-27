@@ -172,12 +172,11 @@ impl Layout {
         b.row(r1 + 4.0, nav, &[(0x25, 1.0), (0x28, 1.0), (0x27, 1.0)]);
 
         // テンキー。数字と . は NumLock オフ時に出すテンキー由来の VK も持つ。
+        // / はエンジンに常にテンキー由来フラグ付きで届く(SPEC.md §3.1)。
         let num = 18.5;
-        b.row(
-            r1,
-            num,
-            &[(0x90, 1.0), (0x6F, 1.0), (0x6A, 1.0), (0x6D, 1.0)],
-        );
+        b.row(r1, num, &[(0x90, 1.0)]);
+        b.key(&[np(0x6F)], num + 1.0, r1, 1.0, 1.0);
+        b.row(r1, num + 2.0, &[(0x6A, 1.0), (0x6D, 1.0)]);
         b.key(&[0x67, np(0x24)], num, r1 + 1.0, 1.0, 1.0);
         b.key(&[0x68, np(0x26)], num + 1.0, r1 + 1.0, 1.0, 1.0);
         b.key(&[0x69, np(0x21)], num + 2.0, r1 + 1.0, 1.0, 1.0);
@@ -268,6 +267,9 @@ mod tests {
         assert_eq!(key(0x65).codes, vec![KeyCode(0x65), KeyCode(0x0C)]);
         assert_eq!(key(0x6E).codes, vec![KeyCode(0x6E), KeyCode(np(0x2E))]);
         assert_eq!(key(np(0x0D)).primary(), KeyCode(np(0x0D)));
+        // テンキーの / はフラグ付きだけを持つ。フラグなしの 0x6F は配列にない
+        assert_eq!(key(np(0x6F)).codes, vec![KeyCode(np(0x6F))]);
+        assert_eq!(layout.find(KeyCode(0x6F)), None);
         // フラグなしはナビゲーションクラスタ・メインの Enter
         assert_eq!(key(0x25).codes, vec![KeyCode(0x25)]);
         assert_eq!(key(0x0D).codes, vec![KeyCode(0x0D)]);

@@ -8,7 +8,8 @@ Windows 11 の PowerToys Keyboard Manager のキーリマップを、キーボ�
 
 - 対象 OS: Windows 11(x86_64)
 - 対象: PowerToys Keyboard Manager(新エディタ `useNewEditor: true` の環境で確認済み)
-- 配布形態: 単一の exe(インストーラは未決定)
+- 配布形態: ポータブル版(単一の exe)のみ。インストーラは用意しない
+- 本アプリのデータ(保存したキーマップ、バックアップ、本アプリの設定)は exe と同じフォルダに置く。書き込めない場所に置かれたときはエラーで知らせる
 
 ## 2. 技術スタック
 
@@ -39,6 +40,10 @@ Windows 11 の PowerToys Keyboard Manager のキーリマップを、キーボ�
 - 最上位ビット `0x80000000` は**テンキー由来**を表すフラグ(PowerToys のソースでの名前は `numpadOriginBit`。`src/common/interop/keyboard_layout.cpp`)。Windows の「拡張キー」とは意味が逆なので注意
   - 例: `2147483685` = `0x80000025` = テンキーの 4(NumLock オフ時の ←)。フラグのない `37`(`0x25`)はナビゲーションクラスタの矢印 ←
   - フラグが付きうる VK: Left / Right / Up / Down / Insert / Delete / PgUp / PgDn / Home / End / Enter / Divide(テンキーの /)
+  - エンジンは押されたキーを次の規則で符号化してから照合する(`src/modules/keyboardmanager/common/Helpers.cpp` の `EncodeKeyNumpadOrigin`)
+    - Left / Right / Up / Down / Insert / Delete / PgUp / PgDn / Home / End: Windows の拡張キーで**ない**とき(= テンキー)にフラグを付ける
+    - Enter / Divide: Windows の拡張キーで**ある**とき(= テンキー)にフラグを付ける
+    - したがってテンキーの / は常に `0x8000006F` として届く。フラグなしの `0x6F` をリマップ元にしても効かない
 - テンキーの 1 つの物理キーは、NumLock の状態によって複数の VK に対応する。例: テンキーの 4 は `VK_NUMPAD4`(`0x64`)と `0x80000025`、テンキーの 5 は `VK_NUMPAD5`(`0x65`)と `VK_CLEAR`(`0x0C`、フラグなし)、テンキーの . は `VK_DECIMAL`(`0x6E`)と `0x8000002E`
 - PowerToys 独自の値(`src/common/interop/shared_constants.h`): `0x100` = `VK_DISABLED`(表示名 "Disable"。キーの無効化)、`0x104` = `VK_WIN_BOTH`(表示名 "Win"。左右どちらの Win でも)
 - 想定する使い方の例: NumLock や Shift の状態にかかわらずテンキーで数字を入力させる(Shift+テンキーがナビゲーション操作にならず Shift+Num1 などとして届く)ために、テンキー由来の各 VK をテンキーの数字へリマップする(MMO などのゲームでの利用)
@@ -52,7 +57,8 @@ Windows 11 の PowerToys Keyboard Manager のキーリマップを、キーボ�
 
 ### 3.3 `settings.json`
 
-- `activeConfiguration`(既定 `"default"`)、`useNewEditor` など
+- 値は `properties` の下に `{ "value": ... }` の形で入っている。例: `properties.activeConfiguration.value`(既定 `"default"`)、`properties.keyboardConfigurations.value`(配列)、`properties.useNewEditor`(真偽値がそのまま入る)
+- `activeConfiguration` の値は、ファイル名として安全なもの(空でない、パス区切り `\` `/`・`..`・`:`・`< > " | ? *`・制御文字を含まない、Windows の予約デバイス名 CON / PRN / AUX / NUL / COM0–9 / LPT0–9 でない)だけを使う。`settings.json` が存在しないか値がないときは `default` とみなす。存在するのに読めない・解析できないときはエラーにする。安全でなければ保存を中止してユーザーに知らせる
 
 ## 4. 機能
 
@@ -65,17 +71,17 @@ Windows 11 の PowerToys Keyboard Manager のキーリマップを、キーボ�
   - テンキーの各キーは NumLock オン/オフ時の VK をすべて持ち、どれかがリマップ元ならそのキーを色で示す
   - 選択中のキーの名前・コード・関係するリマップを表示する
 - UI 文字列を言語ごとの対応表から引く土台(英語のみ)
+- キー→キーのリマップの追加・変更・削除(リマップ先は表示名つきの一覧から選ぶ。テンキー由来のフラグ付きコードはリマップ先に選べない)
+- 保存(§4.8)。未保存のまま閉じるときの確認、外部の変更を検知したあとの読み直し
 
 ### 4.2 予定
 
-1. キー→キーのリマップの追加・変更・削除
-2. ショートカットのリマップ(グローバル/アプリごと)
-3. テキストへのリマップ
-4. 保存
-5. キーマップの切り替え(§4.5)
-6. キーマップのプリセット(§4.6)
-7. 導入前の設定のバックアップと復元(§4.7)
-8. 左右を区別しない Ctrl / Alt / Shift(0x10–0x12)と Win(0x104)をキーボード図でどう示すか(未決定)
+1. ショートカットのリマップ(グローバル/アプリごと)
+2. テキストへのリマップ
+3. キーマップの切り替え(§4.5)
+4. キーマップのプリセット(§4.6)
+5. 導入前の設定のバックアップと復元(§4.7)
+6. 左右を区別しない Ctrl / Alt / Shift(0x10–0x12)と Win(0x104)をキーボード図でどう示すか(未決定)
 
 ### 4.3 キーボードの配列
 
@@ -92,16 +98,40 @@ Windows 11 の PowerToys Keyboard Manager のキーリマップを、キーボ�
 ### 4.5 キーマップの切り替え
 
 - あらかじめ保存しておいた複数のキーマップのうち、どれかにすぐ切り替えられるようにする
+- 切り替えはアプリの画面からと、ホットキーからの両方で行える
+- キーマップは本アプリ独自に、データフォルダ(§1)へ保存する。切り替えは、選んだキーマップの内容で `default.json` を書き換えて保存する(§4.8 の保存処理をそのまま使う)
+- ホットキーはキーマップごとに割り当てる(例: Ctrl+Alt+1 で 1 つ目のキーマップ)
+- ホットキーを受け付けるため、タスクトレイに常駐する。ウィンドウを閉じてもトレイに残り、トレイのメニューからも切り替えられる
+- Windows へのサインイン時に自動で起動し、ウィンドウは開かずにタスクトレイにだけ表示する
+  - 登録先は `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`(管理者権限が不要で、ポータブル版でも使える)。値には exe のフルパスと、トレイだけで起動することを示す引数を入れる
+  - 既定で有効。アプリの設定で無効にできる(無効にしたら登録を消す)
+  - ポータブル版で exe が移動されても追従するよう、有効なら起動のたびに登録内容を現在の exe のパスに合わせる
+- ホットキーの登録に失敗したとき(他のアプリと衝突しているなど)は、どのキーマップのホットキーが使えないかを画面で知らせる
 
 ### 4.6 キーマップのプリセット
 
-- よく知られたキー配列(大西配列など)をプリセットとして同梱し、選ぶだけで適用できるようにする
+- よく知られたキー配列をプリセットとして同梱し、選ぶだけで適用できるようにする
+- 初期の同梱プリセットは大西配列のみ(US 配列用)
+  - 大西配列の利用条件を明示した資料は見つからなかったが、公開ページの表現からパブリックドメインに近い扱いと判断し、非商用であることも踏まえて同梱する(2026-10-28、ユーザーの判断と責任による)
+- 大西配列の定義(出典: https://o24.works/layout/ 、2026-10-28 確認)。US 配列の物理キーの位置に対して、次の文字を割り当てる(左から右)
+
+  | 行 | QWERTY での物理キー | 大西配列 |
+  |---|---|---|
+  | 上段 | Q W E R T Y U I O P | Q L U , . F W R Y P |
+  | 中段 | A S D F G H J K L ; | E I A O - K T N S H |
+  | 下段 | Z X C V B N M , . / | Z X C V ; G D M J B |
+
+  - キー→キーのリマップ(`remapKeys.inProcess`)として表す。物理キーと同じ文字になるキー(Q、P、Z、X、C、V など)にはリマップを作らない
+  - この 30 キー以外(数字の段、元の `-` キーなど)は変えない
+  - PowerToys のキー→キーのリマップは、Ctrl などと組み合わせたショートカットにも効く(例: 物理キー C は C のままだが、物理キー S を押した Ctrl+S は Ctrl+I になる)。これはプリセットの性質として画面で注意書きを出す
 
 ### 4.7 導入前の設定のバックアップと復元
 
-- 本ソフトウェアを導入したときに、その時点の PowerToys Keyboard Manager の設定をバックアップする
-- バックアップした設定にいつでも戻せるようにする
-- アンインストールするときは、バックアップした設定に戻すかどうかをユーザーに尋ねる
+- インストーラがないため、「導入時」は本アプリの初回起動時とする。初回起動時に、その時点の PowerToys Keyboard Manager の設定をバックアップする
+- バックアップした設定にいつでも戻せるようにする。そのための専用のボタン(「導入前の設定に戻す」)を用意し、押したら確認してから戻す
+- アンインストーラもないため、「アンインストール時に戻すか尋ねる」は、この専用のボタンで代える
+- 初回起動時のバックアップの対象は `settings.json`・`editorSettings.json`・リマップの定義ファイル(`activeConfiguration` のもの)の 3 つ。データフォルダ(§1)に保存し、以後は上書きしない
+- 戻すときはリマップの定義ファイルだけを §4.8 の保存処理で書き戻す(`editorSettings.json` は PowerToys の新エディタが起動時に合わせ直すため)。ほかの 2 つは控えとして残す
 
 ### 4.8 保存
 
@@ -110,7 +140,7 @@ Windows 11 の PowerToys Keyboard Manager のキーリマップを、キーボ�
   - `editorSettings.json` は書き込まない。削除したリマップが新エディタ側でどう扱われるかは未確認
 - 書き込みの安全策
   - 一時ファイルに書いてから置き換える(同じフォルダに一時ファイルを作り、rename で置換する)
-  - 上書きする前の `default.json` を、本アプリのフォルダ(`%LOCALAPPDATA%\keymap-studio\backups\`)に世代バックアップとして残す。既定は 10 世代。導入時のバックアップ(§4.7)とは別に管理する
+  - 上書きする前の `default.json` を、本アプリのデータフォルダ(exe と同じフォルダの `backups\`。§1)に世代バックアップとして残す。既定は 10 世代。導入時のバックアップ(§4.7)とは別に管理する
   - 書き込みの間は `editorTransaction.lock` を排他的に開く(PowerToys の新エディタと同じ方式: `FileShare.None` で開き、取れなければ 50ms 間隔で再試行、10 秒でタイムアウト)。取れなければ保存せずにユーザーに知らせる
   - 読み込んだあとに `default.json` が他のプログラムに変更されていたら(読み込んだ時点の内容と比べて検知する)、上書きせずにユーザーに知らせる
 - 反映の検証結果(2026-10-28、ユーザーの実環境、`useNewEditor: true`)
@@ -118,7 +148,7 @@ Windows 11 の PowerToys Keyboard Manager のキーリマップを、キーボ�
   - PowerToys の設定画面で Keyboard Manager をオフ→オンにすると、書き換えた内容が反映された
   - オフ→オンでは `default.json`・`editorSettings.json`・`settings.json` のどれも書き換えられなかった
   - 書き換えたあとに名前付きイベント `PowerToys_KeyboardManager_Event_Settings` をシグナルすると、オフ→オンなしで即座に反映された
-- 反映のさせ方: 書き込みが成功したら、名前付きイベント `PowerToys_KeyboardManager_Event_Settings` をシグナルする
+- 反映のさせ方: 書き込みが成功したら、名前付きイベント `PowerToys_KeyboardManager_Event_Settings` をシグナルする。本アプリは既存のイベントを `OpenEventW` で開く(`CreateEventW` だと PowerToys が起動していなくても成功してしまい、反映されていないことを検知できないため)
   - 根拠: PowerToys 自身も保存後に同じことをしている(`src/modules/keyboardmanager/common/MappingConfiguration.cpp` の `SaveSettingsToFile` が `CreateEvent(nullptr, false, false, SettingsEventName)` → `SetEvent`)。エンジンはこのイベントを待ち受けて設定を読み直す(`KeyboardManagerEngineLibrary/KeyboardManager.cpp`)。イベント名は `common/KeyboardManagerConstants.h` の `SettingsEventName`
   - シグナルに失敗したとき(PowerToys が起動していない、など)は、保存は成功として扱い、反映されていない可能性をユーザーに知らせる
 - 書き込むファイル名は `settings.json` の `activeConfiguration` に `.json` を付けたもの(既定 `default.json`)。PowerToys も `currentConfig + ".json"` に保存している
@@ -128,6 +158,3 @@ Windows 11 の PowerToys Keyboard Manager のキーリマップを、キーボ�
 - **UI の言語の切り替え方法**: OS の言語設定から自動で選ぶか、アプリ内の設定で切り替えるか。日本語の翻訳と CJK フォントの埋め込みをいつ行うか
 - **JIS 配列への対応時期**と、配列を切り替える UI
 - **対象とする操作の種類**: プログラムの起動、URI を開く、など新エディタの機能にどこまで対応するか
-- **キーマップの保存先と切り替え方**(§4.5): 本アプリ独自の保存先に持つか、PowerToys の仕組み(`settings.json` の `activeConfiguration`、新エディタの `Profiles`)を使うか。切り替えの操作をアプリの画面だけにするか、ホットキーやタスクトレイからも行えるようにするか
-- **同梱するプリセット**(§4.6): 大西配列のほかに何を入れるか。US と JIS で物理配列が違う分をどう扱うか。各配列の利用条件の確認
-- **「導入時」と「アンインストール」の定義**(§4.7): インストーラを用意するか(§1 では未決定)。用意しない場合は、初回起動時のバックアップと、アプリ内の「元に戻す」操作で代える。バックアップの対象(`default.json`・`editorSettings.json`・`settings.json` など)と保存場所
