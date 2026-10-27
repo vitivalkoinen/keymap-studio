@@ -6,9 +6,11 @@ mod edit;
 mod i18n;
 mod initial_backup;
 mod keycap;
+mod keymap;
 mod keys;
 mod layout;
 mod matching;
+mod preset;
 mod save;
 
 use std::{
@@ -194,6 +196,8 @@ struct Places {
     initial_backup_dir: Option<PathBuf>,
     /// 世代バックアップを置くフォルダ(exe と同じフォルダの `backups`)
     backup_dir: Option<PathBuf>,
+    /// キーマップを置くフォルダ(exe と同じフォルダの `keymaps`。§4.5.1)
+    keymaps_dir: Option<PathBuf>,
 }
 
 impl Places {
@@ -202,6 +206,7 @@ impl Places {
             powertoys_root: config::powertoys_root(),
             initial_backup_dir: initial_backup::default_dir(),
             backup_dir: save::default_backup_dir(),
+            keymaps_dir: keymap::default_dir(),
         }
     }
 }
@@ -277,14 +282,17 @@ struct Document {
     config: Config,
     /// 読み込んだ(または最後に保存した)時点のファイルの内容。外部の変更の検知に使う
     snapshot: Vec<u8>,
-    /// 読み込んだ(または最後に保存した)時点のキー→キーのリマップ。未保存の変更の判定に使う
+    /// 読み込んだ(または最後に保存した)時点のキー→キーのリマップ。キーボード図の色分けに使う
     saved: SourceMap,
+    /// 読み込んだ(または最後に保存した)時点の設定。未保存の変更と「使用中」の判定、適用の元にする
+    saved_config: Config,
 }
 
 impl Document {
     fn load(path: &std::path::Path) -> Result<Self, String> {
         config::load(path).map(|(config, snapshot)| Document {
             saved: matching::source_map(&config.remap_keys.in_process),
+            saved_config: config.clone(),
             config,
             snapshot,
         })
@@ -306,15 +314,21 @@ impl Document {
     /// 保存していない変更があるか。
     ///
     /// 編集のたびに立てるフラグではなく、保存済みの内容と比べて決める。編集を元に戻して
-    /// 差がなくなれば未保存ではなくなる。比べるのはキー→キーのリマップだけ
-    /// (編集できるのはそこだけのため)。
+    /// 差がなくなれば未保存ではなくなる。
     ///
-    /// 比べる単位は、`originalKeys` と `newRemapKeys` を解析したキーコードの値
-    /// ([`matching::source_map`])。ファイル上の文字列は比べないので、表記の違い
-    /// (リマップ元の正規化で同じになるフラグの有無など)・エントリの並び順・未知のフィールドは
-    /// 差とみなさない。
+    /// 比べ方は [`keymap::same_remaps`]。キー→キーのリマップは解析したキーコードの値で比べるので、
+    /// 表記の違い(リマップ元の正規化で同じになるフラグの有無など)・エントリの並び順・
+    /// 未知のフィールドは差とみなさない。キーマップを編集に読み込んだときはほかの区分も
+    /// 変わりうるので、ほかの 3 つの区分は JSON として比べる。
     fn is_dirty(&self) -> bool {
-        self.current() != self.saved
+        !keymap::same_remaps(&self.config, &self.saved_config)
+    }
+
+    /// 保存(または適用)して `written` を書き込んだあとの状態にする。
+    fn mark_saved(&mut self, written: Vec<u8>) {
+        self.snapshot = written;
+        self.saved = self.current();
+        self.saved_config = self.config.clone();
     }
 }
 
@@ -351,11 +365,51 @@ enum Status {
     RestoreBackupUnreadable(String),
     /// 書き戻しに失敗した
     RestoreFailed(save::SaveError),
+    /// キーマップを新しく保存した(名前)
+    KeymapSaved(String),
+    /// キーマップを今の内容で上書きした(名前)
+    KeymapOverwritten(String),
+    /// キーマップの名前を変えた(新しい名前)
+    KeymapRenamed(String),
+    /// キーマップを削除した(名前)
+    KeymapDeleted(String),
+    /// キーマップを書き出した(書き出し先)
+    KeymapExported(String),
+    /// キーマップを取り込んだ(名前)
+    KeymapImported(String),
+    /// キーマップのファイルの操作に失敗した(詳細はそのまま表示する)
+    KeymapFailed(String),
+    /// 取り込もうとしたファイルを受け付けなかった
+    ImportRejected(keymap::InvalidKeymap),
+    /// キーマップのフォルダ(exe と同じフォルダの `keymaps`)が分からない
+    KeymapDirNotFound,
+    /// キーマップまたはプリセットを適用した(名前)
+    Applied(String),
+    /// 適用したが、エンジンへの通知に失敗した
+    AppliedNotApplied(String, save::SignalError),
+    /// キーマップまたはプリセットを編集に読み込んだ(名前)
+    LoadedIntoEditor(String),
+    /// プリセットを今の編集に重ねた(名前)
+    PresetOverlaid(String),
 }
 
 impl Status {
     fn is_error(&self) -> bool {
-        !matches!(self, Status::Saved | Status::Reloaded | Status::Restored)
+        !matches!(
+            self,
+            Status::Saved
+                | Status::Reloaded
+                | Status::Restored
+                | Status::KeymapSaved(_)
+                | Status::KeymapOverwritten(_)
+                | Status::KeymapRenamed(_)
+                | Status::KeymapDeleted(_)
+                | Status::KeymapExported(_)
+                | Status::KeymapImported(_)
+                | Status::Applied(_)
+                | Status::LoadedIntoEditor(_)
+                | Status::PresetOverlaid(_)
+        )
     }
 
     /// 外部の変更を検知して保存を中止したか(読み直しの操作を出す)。
@@ -406,6 +460,23 @@ impl Status {
             }
             // 書き戻しでは外部の変更を検知しないので起こらない
             Status::RestoreFailed(SaveError::Modified) => tr(lang, Msg::RestoreFailed).to_owned(),
+            Status::KeymapSaved(n) => with(Msg::KeymapSaved, n),
+            Status::KeymapOverwritten(n) => with(Msg::KeymapOverwritten, n),
+            Status::KeymapRenamed(n) => with(Msg::KeymapRenamed, n),
+            Status::KeymapDeleted(n) => with(Msg::KeymapDeleted, n),
+            Status::KeymapExported(p) => with(Msg::KeymapExported, p),
+            Status::KeymapImported(n) => with(Msg::KeymapImported, n),
+            Status::KeymapFailed(d) => with(Msg::KeymapFailed, d),
+            Status::ImportRejected(e) => with(Msg::ImportRejected, &invalid_keymap_reason(lang, e)),
+            Status::KeymapDirNotFound => tr(lang, Msg::KeymapDirNotFound).to_owned(),
+            Status::Applied(n) => with(Msg::Applied, n),
+            Status::AppliedNotApplied(n, e) => format!(
+                "{}: {n} / {}",
+                tr(lang, Msg::Applied),
+                with(Msg::SavedNotApplied, &signal_detail(lang, e))
+            ),
+            Status::LoadedIntoEditor(n) => with(Msg::LoadedIntoEditor, n),
+            Status::PresetOverlaid(n) => with(Msg::PresetOverlaid, n),
         }
     }
 }
@@ -426,6 +497,61 @@ enum DialogChoice {
     Save,
     Discard,
     Cancel,
+}
+
+/// 適用・編集に読み込むリマップ定義の出どころ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Source {
+    /// 保存したキーマップ(`keymaps` の中のファイル名)
+    Keymap(String),
+    /// 同梱のプリセット
+    Preset(preset::PresetId),
+}
+
+/// キーマップの操作の確認・名前の入力のダイアログ。
+enum KeymapDialog {
+    /// 今の内容を新しいキーマップとして保存する(名前を入力)
+    SaveNew {
+        name: String,
+        focus: bool,
+    },
+    /// 名前を変える
+    Rename {
+        file: String,
+        name: String,
+        focus: bool,
+    },
+    ConfirmDelete {
+        file: String,
+        name: String,
+    },
+    ConfirmOverwrite {
+        file: String,
+        name: String,
+    },
+    /// 未保存の編集があるときに適用する
+    ConfirmApply {
+        source: Source,
+        name: String,
+    },
+    /// 未保存の編集があるときに編集に読み込む
+    ConfirmLoad {
+        source: Source,
+        name: String,
+    },
+}
+
+/// キーマップとプリセットの一覧で押された操作。
+enum PanelAction {
+    SaveNew,
+    Import,
+    Apply(Source),
+    Load(Source),
+    Overwrite(String),
+    Rename(String),
+    Delete(String),
+    Export(String),
+    Overlay(preset::PresetId),
 }
 
 struct App {
@@ -449,8 +575,14 @@ struct App {
     /// 導入前の設定のバックアップ
     initial: InitialBackup,
     log: Log,
+    /// 保存したキーマップ(名前の順)
+    keymaps: Vec<keymap::Entry>,
+    /// `keymaps` にあるが読めなかったファイル
+    unreadable_keymaps: Vec<keymap::Unreadable>,
     status: Option<Status>,
     dialog: Option<Dialog>,
+    /// キーマップの操作の確認・名前の入力のダイアログ
+    keymap_dialog: Option<KeymapDialog>,
     /// 未保存の変更があっても閉じてよい(確認ダイアログで保存または破棄を選んだ)
     allow_close: bool,
 }
@@ -463,7 +595,7 @@ impl App {
             Some(p) => Opened::argument(p, &log),
             None => Opened::powertoys(&places, &log),
         };
-        Self {
+        let mut app = Self {
             lang: Lang::default(),
             path: opened.path,
             doc: opened.doc,
@@ -476,10 +608,15 @@ impl App {
             places,
             initial: opened.initial,
             log,
+            keymaps: Vec::new(),
+            unreadable_keymaps: Vec::new(),
             status: None,
             dialog: None,
+            keymap_dialog: None,
             allow_close: false,
-        }
+        };
+        app.refresh_keymaps();
+        app
     }
 
     /// PowerToys の状態を判定し直し、通常になっていれば初回のバックアップと読み込みに進む
@@ -523,8 +660,7 @@ impl App {
         let opts = save::Options::new(backup_dir.clone());
         let status = match save::save(path, &doc.config, &doc.snapshot, &opts) {
             Ok(written) => {
-                doc.snapshot = written;
-                doc.saved = doc.current();
+                doc.mark_saved(written);
                 match save::signal_settings_changed() {
                     Ok(()) => Status::Saved,
                     Err(e) => Status::SavedNotApplied(e),
@@ -575,6 +711,450 @@ impl App {
             Err(e) => Status::ReloadFailed(e),
         };
         self.set_status("reload", status);
+    }
+
+    /// キーマップのフォルダ。
+    fn store(&self) -> Option<keymap::Store> {
+        self.places.keymaps_dir.clone().map(keymap::Store::new)
+    }
+
+    /// キーマップの一覧を読み直す。
+    fn refresh_keymaps(&mut self) {
+        let (entries, unreadable) = match self.store() {
+            Some(store) => store.list(),
+            None => (Vec::new(), Vec::new()),
+        };
+        self.keymaps = entries;
+        self.unreadable_keymaps = unreadable;
+    }
+
+    /// キーマップのファイルを操作し、結果を `status` に入れて一覧を読み直す。
+    fn keymap_op(&mut self, what: &str, op: impl FnOnce(&keymap::Store) -> Result<Status, String>) {
+        let Some(store) = self.store() else {
+            self.set_status(what, Status::KeymapDirNotFound);
+            return;
+        };
+        let status = op(&store).unwrap_or_else(Status::KeymapFailed);
+        self.set_status(what, status);
+        self.refresh_keymaps();
+    }
+
+    /// 今の内容(キーボード図の内容。未保存の編集も含む)を新しいキーマップとして保存する。
+    fn save_new_keymap(&mut self, name: &str) {
+        let Ok(doc) = &self.doc else {
+            return;
+        };
+        let k = keymap::KeymapFile::new(name.trim(), &doc.config);
+        self.keymap_op("keymap save", |store| {
+            store.create(&k)?;
+            Ok(Status::KeymapSaved(k.name.clone()))
+        });
+    }
+
+    /// キーマップ `file` を今の内容で上書きする。
+    fn overwrite_keymap(&mut self, file: &str) {
+        let Ok(doc) = &self.doc else {
+            return;
+        };
+        let definition = doc.config.clone();
+        self.keymap_op("keymap overwrite", |store| {
+            let k = store.overwrite(file, &definition)?;
+            Ok(Status::KeymapOverwritten(k.name))
+        });
+    }
+
+    fn rename_keymap(&mut self, file: &str, name: &str) {
+        self.keymap_op("keymap rename", |store| {
+            let k = store.rename(file, name.trim())?;
+            Ok(Status::KeymapRenamed(k.name))
+        });
+    }
+
+    fn delete_keymap(&mut self, file: &str) {
+        let name = self.keymap_name(file);
+        self.keymap_op("keymap delete", |store| {
+            store.delete(file)?;
+            Ok(Status::KeymapDeleted(name))
+        });
+    }
+
+    fn export_keymap(&mut self, file: &str, dest: &Path) {
+        self.keymap_op("keymap export", |store| {
+            store.export(file, dest)?;
+            Ok(Status::KeymapExported(dest.display().to_string()))
+        });
+    }
+
+    /// `src` を検証して取り込む。受け付けないときは理由を表示する。
+    fn import_keymap(&mut self, src: &Path) {
+        let existing = self.keymaps.clone();
+        let what = format!("keymap import {}", src.display());
+        self.keymap_op(&what, |store| match store.import(src, &existing) {
+            Ok(e) => Ok(Status::KeymapImported(e.keymap.name)),
+            Err(keymap::ImportError::Invalid(reason)) => Ok(Status::ImportRejected(reason)),
+            Err(keymap::ImportError::Io(d)) => Err(d),
+        });
+    }
+
+    /// 一覧にあるキーマップの名前(なければファイル名)。
+    fn keymap_name(&self, file: &str) -> String {
+        self.keymaps
+            .iter()
+            .find(|e| e.file_name == file)
+            .map_or_else(|| file.to_owned(), |e| e.keymap.name.clone())
+    }
+
+    /// 適用・編集に読み込むリマップ定義と、その名前。キーマップはファイルから読み直す。
+    fn source_definition(&mut self, source: &Source) -> Option<(String, Config)> {
+        match source {
+            Source::Preset(id) => {
+                Some((tr(self.lang, preset_msg(*id)).to_owned(), id.definition()))
+            }
+            Source::Keymap(file) => {
+                let store = self.store()?;
+                match store.read(file) {
+                    Ok(k) => Some((k.name, k.definition)),
+                    Err(e) => {
+                        self.set_status("keymap read", Status::KeymapFailed(e));
+                        self.refresh_keymaps();
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// キーマップまたはプリセットを適用する(§4.5.1)。保存済みの内容のリマップ定義の 4 つの区分を
+    /// 丸ごと置き換え、§4.8 の保存処理ですぐ反映する。編集中の内容は破棄する。
+    fn apply(&mut self, source: &Source) {
+        if self.path.is_none() || self.doc.is_err() {
+            return;
+        }
+        if self.initial.blocks_save() {
+            self.set_status("apply", Status::SaveBlockedByInitialBackup);
+            return;
+        }
+        let Some(backup_dir) = self.places.backup_dir.clone() else {
+            self.set_status("apply", Status::BackupDirNotFound);
+            return;
+        };
+        let Some((name, definition)) = self.source_definition(source) else {
+            return;
+        };
+        let (Some(path), Ok(doc)) = (&self.path, &mut self.doc) else {
+            return;
+        };
+        let applied = keymap::apply_definition(&doc.saved_config, &definition);
+        let opts = save::Options::new(backup_dir);
+        let status = match save::save(path, &applied, &doc.snapshot, &opts) {
+            Ok(written) => {
+                doc.config = applied;
+                doc.mark_saved(written);
+                match save::signal_settings_changed() {
+                    Ok(()) => Status::Applied(name.clone()),
+                    Err(e) => Status::AppliedNotApplied(name.clone(), e),
+                }
+            }
+            Err(e) => Status::SaveFailed(e),
+        };
+        self.picking = None;
+        self.set_status(&format!("apply {name} to {}", path.display()), status);
+    }
+
+    /// キーマップまたはプリセットを編集に読み込む。保存済みの内容の 4 つの区分を置き換えた状態にし、
+    /// Save を押すまで反映しない。編集中の内容は破棄する。
+    fn load_into_editor(&mut self, source: &Source) {
+        if self.doc.is_err() {
+            return;
+        }
+        let Some((name, definition)) = self.source_definition(source) else {
+            return;
+        };
+        let Ok(doc) = &mut self.doc else {
+            return;
+        };
+        doc.config = keymap::apply_definition(&doc.saved_config, &definition);
+        self.picking = None;
+        self.set_status("load into editor", Status::LoadedIntoEditor(name));
+    }
+
+    /// プリセットを今の編集に重ねる(§4.6)。同じリマップ元はプリセットを優先する。
+    fn overlay_preset(&mut self, id: preset::PresetId) {
+        let Ok(doc) = &mut self.doc else {
+            return;
+        };
+        let preset = id.definition();
+        keymap::overlay(
+            &mut doc.config.remap_keys.in_process,
+            &preset.remap_keys.in_process,
+        );
+        self.picking = None;
+        let name = tr(self.lang, preset_msg(id)).to_owned();
+        self.set_status("overlay preset", Status::PresetOverlaid(name));
+    }
+
+    /// 適用できるか。できなければ理由。
+    fn apply_unavailable(&self, lang: Lang) -> Option<&'static str> {
+        if self.doc.is_err() || self.path.is_none() {
+            Some(tr(lang, Msg::NoConfigLoaded))
+        } else if self.initial.blocks_save() {
+            Some(tr(lang, Msg::SaveBlockedByInitialBackup))
+        } else {
+            None
+        }
+    }
+
+    /// 一覧の操作の出どころの表示名。
+    fn source_name(&self, source: &Source) -> String {
+        match source {
+            Source::Keymap(file) => self.keymap_name(file),
+            Source::Preset(id) => tr(self.lang, preset_msg(*id)).to_owned(),
+        }
+    }
+
+    /// キーマップとプリセットの一覧(§4.5.1・§4.6)。押された操作を実行する。
+    /// `frame` はファイルのダイアログの親にするウィンドウ。
+    fn keymaps_panel(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        let lang = self.lang;
+        let has_doc = self.doc.is_ok();
+        let apply_reason = self.apply_unavailable(lang);
+        let saved_config = self.doc.as_ref().ok().map(|d| &d.saved_config);
+        let in_use = |def: &Config| saved_config.is_some_and(|c| keymap::same_remaps(def, c));
+        let mut actions = Vec::new();
+
+        ui.heading(tr(lang, Msg::KeymapsHeading));
+        ui.horizontal_wrapped(|ui| {
+            let new = ui
+                .add_enabled(has_doc, egui::Button::new(tr(lang, Msg::SaveAsNewKeymap)))
+                .on_disabled_hover_text(tr(lang, Msg::NoConfigLoaded));
+            if new.clicked() {
+                actions.push(PanelAction::SaveNew);
+            }
+            if ui.button(tr(lang, Msg::ImportKeymap)).clicked() {
+                actions.push(PanelAction::Import);
+            }
+        });
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical()
+            .id_salt("keymaps_list")
+            .show(ui, |ui| {
+                if self.keymaps.is_empty() {
+                    ui.weak(tr(lang, Msg::NoKeymaps));
+                }
+                for e in &self.keymaps {
+                    let file = &e.file_name;
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong(&e.keymap.name);
+                            if in_use(&e.keymap.definition) {
+                                in_use_badge(ui, lang);
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            let source = Source::Keymap(file.clone());
+                            if apply_button(ui, lang, apply_reason) {
+                                actions.push(PanelAction::Apply(source.clone()));
+                            }
+                            if small_enabled(ui, has_doc, tr(lang, Msg::LoadIntoEditor), lang) {
+                                actions.push(PanelAction::Load(source));
+                            }
+                            if small_enabled(ui, has_doc, tr(lang, Msg::OverwriteKeymap), lang) {
+                                actions.push(PanelAction::Overwrite(file.clone()));
+                            }
+                            if ui.small_button(tr(lang, Msg::RenameKeymap)).clicked() {
+                                actions.push(PanelAction::Rename(file.clone()));
+                            }
+                            if ui.small_button(tr(lang, Msg::DeleteKeymap)).clicked() {
+                                actions.push(PanelAction::Delete(file.clone()));
+                            }
+                            if ui.small_button(tr(lang, Msg::ExportKeymap)).clicked() {
+                                actions.push(PanelAction::Export(file.clone()));
+                            }
+                        });
+                    });
+                }
+                if !self.unreadable_keymaps.is_empty() {
+                    ui.colored_label(ui.visuals().warn_fg_color, tr(lang, Msg::UnreadableKeymaps));
+                    for u in &self.unreadable_keymaps {
+                        ui.weak(format!(
+                            "{}: {}",
+                            u.file_name,
+                            invalid_keymap_reason(lang, &u.reason)
+                        ));
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.heading(tr(lang, Msg::PresetsHeading));
+                for &id in preset::PresetId::ALL {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong(tr(lang, preset_msg(id)));
+                            ui.weak(tr(lang, Msg::ReadOnlyPreset));
+                            if in_use(&id.definition()) {
+                                in_use_badge(ui, lang);
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            if apply_button(ui, lang, apply_reason) {
+                                actions.push(PanelAction::Apply(Source::Preset(id)));
+                            }
+                            if small_enabled(ui, has_doc, tr(lang, Msg::OverlayPreset), lang) {
+                                actions.push(PanelAction::Overlay(id));
+                            }
+                        });
+                    });
+                }
+                ui.label(
+                    egui::RichText::new(tr(lang, Msg::PresetShortcutNote))
+                        .small()
+                        .color(ui.visuals().warn_fg_color),
+                );
+            });
+
+        for action in actions {
+            self.panel_action(action, frame);
+        }
+    }
+
+    /// 一覧で押された操作を実行する。確認や名前の入力が要るものはダイアログを開く。
+    fn panel_action(&mut self, action: PanelAction, frame: &eframe::Frame) {
+        let lang = self.lang;
+        match action {
+            PanelAction::SaveNew => {
+                self.keymap_dialog = Some(KeymapDialog::SaveNew {
+                    name: String::new(),
+                    focus: true,
+                });
+            }
+            PanelAction::Import => {
+                if let Some(src) = file_dialog(lang, Msg::ImportKeymap, frame).pick_file() {
+                    self.import_keymap(&src);
+                }
+            }
+            PanelAction::Apply(source) => {
+                if self.is_dirty() {
+                    let name = self.source_name(&source);
+                    self.keymap_dialog = Some(KeymapDialog::ConfirmApply { source, name });
+                } else {
+                    self.apply(&source);
+                }
+            }
+            PanelAction::Load(source) => {
+                if self.is_dirty() {
+                    let name = self.source_name(&source);
+                    self.keymap_dialog = Some(KeymapDialog::ConfirmLoad { source, name });
+                } else {
+                    self.load_into_editor(&source);
+                }
+            }
+            PanelAction::Overwrite(file) => {
+                let name = self.keymap_name(&file);
+                self.keymap_dialog = Some(KeymapDialog::ConfirmOverwrite { file, name });
+            }
+            PanelAction::Rename(file) => {
+                let name = self.keymap_name(&file);
+                self.keymap_dialog = Some(KeymapDialog::Rename {
+                    file,
+                    name,
+                    focus: true,
+                });
+            }
+            PanelAction::Delete(file) => {
+                let name = self.keymap_name(&file);
+                self.keymap_dialog = Some(KeymapDialog::ConfirmDelete { file, name });
+            }
+            PanelAction::Export(file) => {
+                let dest = file_dialog(lang, Msg::ExportKeymap, frame)
+                    .set_file_name(file.clone())
+                    .save_file();
+                if let Some(dest) = dest {
+                    self.export_keymap(&file, &dest);
+                }
+            }
+            PanelAction::Overlay(id) => self.overlay_preset(id),
+        }
+    }
+
+    /// キーマップの操作のダイアログを表示し、了承されたら実行する。
+    fn show_keymap_dialog(&mut self, ctx: &egui::Context) {
+        let lang = self.lang;
+        let dirty = self.is_dirty();
+        let keymaps = &self.keymaps;
+        let Some(dialog) = &mut self.keymap_dialog else {
+            return;
+        };
+        let mut result: Option<bool> = None;
+        let response = egui::Modal::new(egui::Id::unique("keymap_dialog")).show(ctx, |ui| {
+            ui.set_max_width(440.0);
+            result = match dialog {
+                KeymapDialog::SaveNew { name, focus } => {
+                    let mut text = tr(lang, Msg::NewKeymapPrompt).to_owned();
+                    if dirty {
+                        text.push('\n');
+                        text.push_str(tr(lang, Msg::NewKeymapIncludesUnsaved));
+                    }
+                    name_input(ui, lang, &text, name, focus, keymaps, None, Msg::Save)
+                }
+                KeymapDialog::Rename { file, name, focus } => {
+                    let text = tr(lang, Msg::RenamePrompt);
+                    name_input(
+                        ui,
+                        lang,
+                        text,
+                        name,
+                        focus,
+                        keymaps,
+                        Some(file),
+                        Msg::RenameKeymap,
+                    )
+                }
+                KeymapDialog::ConfirmDelete { name, .. } => {
+                    let text = format!("{}\n\n{name}", tr(lang, Msg::DeleteKeymapConfirm));
+                    confirm(ui, lang, &text, Msg::DeleteKeymap)
+                }
+                KeymapDialog::ConfirmOverwrite { name, .. } => {
+                    let mut text = format!("{}\n\n{name}", tr(lang, Msg::OverwriteKeymapConfirm));
+                    if dirty {
+                        text.push_str("\n\n");
+                        text.push_str(tr(lang, Msg::NewKeymapIncludesUnsaved));
+                    }
+                    confirm(ui, lang, &text, Msg::OverwriteKeymap)
+                }
+                KeymapDialog::ConfirmApply { name, .. } => {
+                    let text = format!("{}\n\n{name}", tr(lang, Msg::ApplyDiscardConfirm));
+                    confirm(ui, lang, &text, Msg::Apply)
+                }
+                KeymapDialog::ConfirmLoad { name, .. } => {
+                    let text = format!("{}\n\n{name}", tr(lang, Msg::LoadDiscardConfirm));
+                    confirm(ui, lang, &text, Msg::LoadIntoEditor)
+                }
+            };
+        });
+        // Esc や背景のクリックは取り消しとみなす
+        if result.is_none() && response.should_close() {
+            result = Some(false);
+        }
+        let Some(ok) = result else {
+            return;
+        };
+        let Some(dialog) = self.keymap_dialog.take() else {
+            return;
+        };
+        if !ok {
+            return;
+        }
+        match dialog {
+            KeymapDialog::SaveNew { name, .. } => self.save_new_keymap(&name),
+            KeymapDialog::Rename { file, name, .. } => self.rename_keymap(&file, &name),
+            KeymapDialog::ConfirmDelete { file, .. } => self.delete_keymap(&file),
+            KeymapDialog::ConfirmOverwrite { file, .. } => self.overwrite_keymap(&file),
+            KeymapDialog::ConfirmApply { source, .. } => self.apply(&source),
+            KeymapDialog::ConfirmLoad { source, .. } => self.load_into_editor(&source),
+        }
     }
 
     /// 導入前の設定に戻せるか。戻せなければ理由を返す。
@@ -734,11 +1314,19 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.dialog = Some(Dialog::CloseWithUnsaved);
+            self.keymap_dialog = None;
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let lang = self.lang;
+        // PowerToys の設定が使える状態でないときは案内だけを出す(§1.1)
+        if !matches!(self.initial, InitialBackup::NotAttempted) {
+            egui::Panel::right("keymaps")
+                .resizable(true)
+                .default_size(300.0)
+                .show(ui, |ui| self.keymaps_panel(ui, frame));
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(p) = &self.path {
                 ui.label(p.display().to_string());
@@ -943,6 +1531,7 @@ impl eframe::App for App {
             }
         });
         self.show_dialog(ui.ctx());
+        self.show_keymap_dialog(ui.ctx());
     }
 }
 
@@ -1423,6 +2012,134 @@ fn category_msg(category: keys::Category) -> Msg {
     }
 }
 
+/// 名前の入力欄と、了承・取り消しのボタン。押されたら `Some(了承したか)`。
+///
+/// 名前が空(空白だけ)か、ほかのキーマップと重なる(大文字と小文字を区別しない。`except` の
+/// ファイルは除く)ときは理由を出し、了承できないようにする。Enter でも了承できる。
+#[allow(clippy::too_many_arguments)]
+fn name_input(
+    ui: &mut egui::Ui,
+    lang: Lang,
+    prompt: &str,
+    name: &mut String,
+    focus: &mut bool,
+    keymaps: &[keymap::Entry],
+    except: Option<&str>,
+    ok: Msg,
+) -> Option<bool> {
+    ui.label(prompt);
+    let field = ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
+    if *focus {
+        field.request_focus();
+        *focus = false;
+    }
+    let problem = if name.trim().is_empty() {
+        Some(Msg::KeymapNameEmpty)
+    } else if keymap::name_taken(keymaps, name, except) {
+        Some(Msg::KeymapNameTaken)
+    } else {
+        None
+    };
+    if let Some(p) = problem {
+        ui.colored_label(ui.visuals().error_fg_color, tr(lang, p));
+    }
+    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    ui.add_space(8.0);
+    let mut result = None;
+    ui.horizontal(|ui| {
+        let ok_clicked = ui
+            .add_enabled(problem.is_none(), egui::Button::new(tr(lang, ok)))
+            .clicked();
+        if ok_clicked || (enter && problem.is_none()) {
+            result = Some(true);
+        }
+        if ui.button(tr(lang, Msg::Cancel)).clicked() {
+            result = Some(false);
+        }
+    });
+    result
+}
+
+/// 確認の文と、了承・取り消しのボタン。押されたら `Some(了承したか)`。
+fn confirm(ui: &mut egui::Ui, lang: Lang, text: &str, ok: Msg) -> Option<bool> {
+    ui.label(text);
+    ui.add_space(8.0);
+    let mut result = None;
+    ui.horizontal(|ui| {
+        if ui.button(tr(lang, ok)).clicked() {
+            result = Some(true);
+        }
+        if ui.button(tr(lang, Msg::Cancel)).clicked() {
+            result = Some(false);
+        }
+    });
+    result
+}
+
+/// 「適用」のボタン。適用できないときは押せず、理由を出す。押されたら `true`。
+fn apply_button(ui: &mut egui::Ui, lang: Lang, unavailable: Option<&str>) -> bool {
+    let response = ui.add_enabled(
+        unavailable.is_none(),
+        egui::Button::new(tr(lang, Msg::Apply)).small(),
+    );
+    match unavailable {
+        Some(reason) => response.on_disabled_hover_text(reason).clicked(),
+        None => response.clicked(),
+    }
+}
+
+/// 設定を読み込めているときだけ押せる小さなボタン。押されたら `true`。
+fn small_enabled(ui: &mut egui::Ui, enabled: bool, text: &str, lang: Lang) -> bool {
+    ui.add_enabled(enabled, egui::Button::new(text).small())
+        .on_disabled_hover_text(tr(lang, Msg::NoConfigLoaded))
+        .clicked()
+}
+
+/// 「使用中」の印。
+fn in_use_badge(ui: &mut egui::Ui, lang: Lang) {
+    let color = ui.visuals().selection.stroke.color;
+    ui.label(
+        egui::RichText::new(format!("● {}", tr(lang, Msg::InUse)))
+            .small()
+            .strong()
+            .color(color),
+    )
+    .on_hover_text(tr(lang, Msg::InUseHint));
+}
+
+/// キーマップのファイルを選ぶダイアログ(`.json` で絞り込む)。`parent` のウィンドウの前に出す。
+fn file_dialog(lang: Lang, title: Msg, parent: &eframe::Frame) -> rfd::FileDialog {
+    rfd::FileDialog::new()
+        .set_parent(parent)
+        .set_title(tr(lang, title))
+        .add_filter(tr(lang, Msg::KeymapFileFilter), &["json"])
+}
+
+/// 受け付けなかったキーマップのファイルの理由。
+fn invalid_keymap_reason(lang: Lang, e: &keymap::InvalidKeymap) -> String {
+    use keymap::InvalidKeymap::*;
+    let with = |msg: Msg, v: &str| {
+        if v.is_empty() {
+            tr(lang, msg).to_owned()
+        } else {
+            format!("{}: {v}", tr(lang, msg))
+        }
+    };
+    match e {
+        Malformed(d) => with(Msg::KeymapInvalidMalformed, d),
+        WrongFormat(v) => with(Msg::KeymapInvalidFormat, v),
+        UnknownVersion(v) => with(Msg::KeymapInvalidVersion, v),
+        WrongLayout(v) => with(Msg::KeymapInvalidLayout, v),
+    }
+}
+
+/// プリセットの表示名。
+fn preset_msg(id: preset::PresetId) -> Msg {
+    match id {
+        preset::PresetId::Onishi => Msg::PresetOnishi,
+    }
+}
+
 fn format_keys(keys: &[KeyCode]) -> String {
     keys.iter()
         .map(|&k| keys::name(k))
@@ -1452,6 +2169,7 @@ mod tests {
                 powertoys_root: Some(tmp.path().join("Microsoft").join("PowerToys")),
                 initial_backup_dir: Some(data.join(initial_backup::DIR_NAME)),
                 backup_dir: Some(data.join("backups")),
+                keymaps_dir: Some(data.join(keymap::DIR_NAME)),
             };
             Env { tmp, places }
         }
@@ -1713,6 +2431,238 @@ mod tests {
         let log = env.log_text();
         assert!(log.contains("save "), "{log}");
         assert!(log.contains("restore "), "{log}");
+    }
+
+    /// 保存したキーマップのうち、使用中のものの名前。
+    fn in_use_names(app: &App) -> Vec<String> {
+        let saved = &app.doc.as_ref().ok().unwrap().saved_config;
+        app.keymaps
+            .iter()
+            .filter(|e| keymap::same_remaps(&e.keymap.definition, saved))
+            .map(|e| e.keymap.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn keymap_save_new_includes_unsaved_edits_and_in_use() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        assert!(app.keymaps.is_empty());
+
+        app.save_new_keymap("  Current  ");
+        assert!(matches!(&app.status, Some(Status::KeymapSaved(n)) if n == "Current"));
+        assert_eq!(app.keymaps.len(), 1);
+        // 今の PowerToys の内容と同じなので使用中
+        assert_eq!(in_use_names(&app), vec!["Current"]);
+
+        // 未保存の編集を含めて保存する。PowerToys の内容とは違うので使用中ではない
+        edit_a_to_c(&mut app);
+        app.save_new_keymap("Edited");
+        let edited = app
+            .keymaps
+            .iter()
+            .find(|e| e.keymap.name == "Edited")
+            .unwrap();
+        let map = matching::source_map(&edited.keymap.definition.remap_keys.in_process);
+        assert_eq!(map[&KeyCode(0x41)], vec![vec![KeyCode(0x43)]]);
+        assert_eq!(in_use_names(&app), vec!["Current"]);
+        // 保存すると使用中が入れ替わる
+        app.save();
+        assert_eq!(in_use_names(&app), vec!["Edited"]);
+        assert!(
+            env.log_text()
+                .contains("keymap save: Saved the keymap: Current")
+        );
+    }
+
+    #[test]
+    fn keymap_apply_replaces_sections_and_saves() {
+        let env = Env::new();
+        fs::create_dir_all(env.km()).unwrap();
+        let path = env.km().join("default.json");
+        fs::write(
+            &path,
+            r#"{"remapKeys":{"inProcess":[{"originalKeys":"65","newRemapKeys":"66"}]},"remapKeysToText":{"inProcess":[]},"remapShortcuts":{"global":[{"originalKeys":"17;65","newRemapKeys":"66"}],"appSpecific":[]},"remapShortcutsToText":{"global":[],"appSpecific":[]},"topLevel":"keep"}"#,
+        )
+        .unwrap();
+        let mut app = env.app(None);
+        // キーマップ: E → F だけ
+        let def: Config = serde_json::from_str(
+            r#"{"remapKeys":{"inProcess":[{"originalKeys":"69","newRemapKeys":"70"}]}}"#,
+        )
+        .unwrap();
+        let store = app.store().unwrap();
+        let file = store.create(&keymap::KeymapFile::new("EF", &def)).unwrap();
+        app.refresh_keymaps();
+        assert!(in_use_names(&app).is_empty());
+
+        app.apply(&Source::Keymap(file));
+        assert!(
+            matches!(&app.status, Some(Status::Applied(n) | Status::AppliedNotApplied(n, _)) if n == "EF"),
+            "{:?}",
+            app.status.as_ref().map(|s| s.message(Lang::En))
+        );
+        let v: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["remapKeys"]["inProcess"][0]["originalKeys"], "69");
+        assert_eq!(v["remapKeys"]["inProcess"].as_array().unwrap().len(), 1);
+        assert_eq!(v["remapShortcuts"]["global"], serde_json::json!([]));
+        assert_eq!(v["topLevel"], "keep");
+        assert!(!app.is_dirty());
+        assert_eq!(in_use_names(&app), vec!["EF"]);
+        // §4.8 の保存処理: 世代バックアップが残る
+        assert_eq!(
+            fs::read_dir(env.places.backup_dir.as_ref().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn apply_discards_unsaved_edits_and_detects_external_changes() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        edit_a_to_c(&mut app);
+        // 未保存の編集は捨て、保存済みの内容を元に置き換える
+        app.apply(&Source::Preset(preset::PresetId::Onishi));
+        assert!(!app.is_dirty());
+        let (cfg, _) = config::load(&env.km().join("default.json")).unwrap();
+        assert!(keymap::same_remaps(
+            &cfg,
+            &preset::PresetId::Onishi.definition()
+        ));
+
+        // 読み込んだあとに外部で変更されていたら上書きしない
+        fs::write(env.km().join("default.json"), DEFAULT_JSON).unwrap();
+        app.apply(&Source::Preset(preset::PresetId::Onishi));
+        assert!(matches!(
+            app.status,
+            Some(Status::SaveFailed(save::SaveError::Modified))
+        ));
+        assert_eq!(
+            fs::read_to_string(env.km().join("default.json")).unwrap(),
+            DEFAULT_JSON
+        );
+    }
+
+    #[test]
+    fn apply_is_refused_while_initial_backup_failed() {
+        let mut env = Env::new();
+        env.install();
+        let blocker = env.tmp.path().join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        env.places.initial_backup_dir = Some(blocker.join(initial_backup::DIR_NAME));
+        let mut app = env.app(None);
+        assert!(app.apply_unavailable(Lang::En).is_some());
+        app.apply(&Source::Preset(preset::PresetId::Onishi));
+        assert!(matches!(
+            app.status,
+            Some(Status::SaveBlockedByInitialBackup)
+        ));
+        assert_eq!(
+            fs::read_to_string(env.km().join("default.json")).unwrap(),
+            DEFAULT_JSON
+        );
+    }
+
+    #[test]
+    fn load_into_editor_and_overlay_make_unsaved_changes() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        // 編集に読み込む: 未保存になり、ファイルは変えない
+        app.load_into_editor(&Source::Preset(preset::PresetId::Onishi));
+        assert!(app.is_dirty());
+        assert!(matches!(app.status, Some(Status::LoadedIntoEditor(_))));
+        assert_eq!(
+            fs::read_to_string(env.km().join("default.json")).unwrap(),
+            DEFAULT_JSON
+        );
+        let doc = app.doc.as_ref().ok().unwrap();
+        assert!(keymap::same_remaps(
+            &doc.config,
+            &preset::PresetId::Onishi.definition()
+        ));
+
+        // 重ねる: 今の編集(A → B と Num 0 → Num 1)にプリセットを重ね、同じリマップ元はプリセットを優先
+        app.reload();
+        let doc = app.doc.as_mut().ok().unwrap();
+        edit::set(
+            &mut doc.config.remap_keys.in_process,
+            KeyCode(0x60),
+            KeyCode(0x61),
+        );
+        app.overlay_preset(preset::PresetId::Onishi);
+        assert!(app.is_dirty());
+        let doc = app.doc.as_ref().ok().unwrap();
+        let map = matching::source_map(&doc.config.remap_keys.in_process);
+        assert_eq!(map[&KeyCode(0x41)], vec![vec![KeyCode(0x45)]]); // A → E(プリセット)
+        assert_eq!(map[&KeyCode(0x60)], vec![vec![KeyCode(0x61)]]); // 残る
+        assert_eq!(map[&KeyCode(0x53)], vec![vec![KeyCode(0x49)]]); // S → I
+        assert_eq!(
+            fs::read_to_string(env.km().join("default.json")).unwrap(),
+            DEFAULT_JSON
+        );
+    }
+
+    #[test]
+    fn keymap_rename_delete_export_import_through_app() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        app.save_new_keymap("Mine");
+        let file = app.keymaps[0].file_name.clone();
+
+        app.rename_keymap(&file, "Renamed");
+        assert_eq!(app.keymaps[0].keymap.name, "Renamed");
+        assert_eq!(app.keymaps[0].file_name, file);
+
+        let dest = env.tmp.path().join("exported.json");
+        app.export_keymap(&file, &dest);
+        assert!(matches!(app.status, Some(Status::KeymapExported(_))));
+
+        // 取り込み: 名前が重なるので連番
+        app.import_keymap(&dest);
+        assert!(matches!(&app.status, Some(Status::KeymapImported(n)) if n == "Renamed (2)"));
+        assert_eq!(app.keymaps.len(), 2);
+
+        // 受け付けないもの
+        app.import_keymap(&env.km().join("default.json"));
+        assert!(matches!(
+            app.status,
+            Some(Status::ImportRejected(keymap::InvalidKeymap::WrongFormat(
+                _
+            )))
+        ));
+        assert_eq!(app.keymaps.len(), 2);
+
+        app.delete_keymap(&file);
+        assert!(matches!(&app.status, Some(Status::KeymapDeleted(n)) if n == "Renamed"));
+        assert_eq!(app.keymaps.len(), 1);
+        let log = env.log_text();
+        assert!(log.contains("keymap import"), "{log}");
+        assert!(log.contains("keymap delete"), "{log}");
+    }
+
+    #[test]
+    fn keymap_overwrite_uses_current_contents() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        app.save_new_keymap("Mine");
+        let file = app.keymaps[0].file_name.clone();
+        edit_a_to_c(&mut app);
+        app.overwrite_keymap(&file);
+        assert!(matches!(app.status, Some(Status::KeymapOverwritten(_))));
+        let map = matching::source_map(&app.keymaps[0].keymap.definition.remap_keys.in_process);
+        assert_eq!(map[&KeyCode(0x41)], vec![vec![KeyCode(0x43)]]);
+        // 上書きしても PowerToys のファイルは変えない
+        assert_eq!(
+            fs::read_to_string(env.km().join("default.json")).unwrap(),
+            DEFAULT_JSON
+        );
     }
 
     #[test]

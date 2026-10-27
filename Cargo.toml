@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 dirs = "7.0.0"
 eframe = "0.37.0"
+rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 

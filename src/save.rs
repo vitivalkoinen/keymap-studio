@@ -190,7 +190,7 @@ pub fn retry_unless<T>(
 }
 
 /// 同じフォルダの一時ファイルに `contents` を書いてから、rename で `path` を置き換える。
-fn write_replace(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub fn write_replace(path: &Path, contents: &[u8]) -> io::Result<()> {
     let file_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
@@ -209,6 +209,44 @@ fn write_replace(path: &Path, contents: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// `path` がなければ `contents` で作る。すでにあれば [`io::ErrorKind::AlreadyExists`] で失敗し、
+/// 既存のファイルは置き換えない。
+///
+/// 同じフォルダの一時ファイルに書いてから、hard link で `path` を作る(hard link の作成は
+/// 作成先があれば失敗するので、確認と作成の間に別のプログラムが作っても置き換えない。
+/// Windows の `CreateHardLinkW` も同じ)。中身を書き終えたファイルだけが `path` に現れる。
+/// hard link を作れないファイルシステム(FAT32 や exFAT の USB メモリなど)では、`create_new` で
+/// `path` を直接開いて書き、途中で失敗したら作りかけのファイルを消す。
+pub fn write_new(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(format!(".{}.keymap-studio.new.tmp", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+
+    let written = (|| {
+        let mut f = File::create(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()
+    })();
+    let linked = written.and_then(|()| fs::hard_link(&tmp, path));
+    let _ = fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => {
+            let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
+            let result = f.write_all(contents).and_then(|()| f.sync_all());
+            if result.is_err() {
+                drop(f);
+                let _ = fs::remove_file(path);
+            }
+            result
+        }
+    }
 }
 
 /// `contents`(上書きする前の `path` の内容)を世代バックアップとして残し、
@@ -475,6 +513,23 @@ mod tests {
         assert!(write_replace(&target, b"{}").is_err());
         assert!(target.is_dir());
         assert_eq!(files_in(tmp.path()), vec!["default.json"]);
+    }
+
+    #[test]
+    fn write_new_creates_but_never_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.json");
+        write_new(&path, b"first").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        let e = write_new(&path, b"second").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        // 一時ファイルは残らない
+        assert_eq!(files_in(tmp.path()), vec!["a.json"]);
+        // 書き込めない場所では失敗し、何も残さない
+        let missing = tmp.path().join("missing").join("b.json");
+        assert!(write_new(&missing, b"x").is_err());
+        assert_eq!(files_in(tmp.path()), vec!["a.json"]);
     }
 
     #[test]
