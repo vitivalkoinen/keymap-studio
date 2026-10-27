@@ -1,27 +1,36 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod app_settings;
 mod applog;
+mod autostart;
 mod config;
 mod edit;
+mod hotkey;
 mod i18n;
+mod icon;
 mod initial_backup;
+mod instance;
 mod keycap;
 mod keymap;
 mod keys;
+mod launch;
 mod layout;
 mod matching;
 mod preset;
 mod save;
+mod tray;
 
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
 
+use app_settings::{AppSettings, AssignError, Target};
 use applog::Log;
 use config::{Config, KeyCode, PathError, PowerToysState, Remap};
 use eframe::egui;
-use i18n::{Lang, Msg, tr};
+use hotkey::Hotkey;
+use i18n::{Lang, Msg, fill, tr};
 use layout::Layout;
 use matching::{KeyRemapLabel, KeyState, Role, SourceMap};
 
@@ -31,16 +40,70 @@ const POWERTOYS_INSTALL_URL: &str = "https://learn.microsoft.com/windows/powerto
 fn main() -> eframe::Result {
     // 引数でパスを指定できる(WSL での開発時は /mnt/c/... を渡す)。
     // 指定がなければ PowerToys の状態を判定し(§1.1)、settings.json の activeConfiguration から
-    // 決める。読み込みと保存は同じファイル。
-    let arg = std::env::args_os().nth(1).map(PathBuf::from);
+    // 決める。読み込みと保存は同じファイル。`--tray` ならウィンドウを出さずトレイにだけ表示する
+    // (§4.5)。
+    let launch = launch::parse(std::env::args_os().skip(1));
     let log = Log::default_location();
-    let app = App::new(arg, Places::default_locations(), log);
+    let (arg, tray_only) = match launch {
+        launch::Launch::File(p) => (Some(p), false),
+        launch::Launch::Resident { tray_only } => (None, tray_only),
+    };
 
+    // 二重起動の防止(§4.5.2)。引数でファイルを指定した起動は対象外
+    let guard = if arg.is_none() {
+        match instance::acquire() {
+            Ok(instance::Instance::Primary(g)) => Some(g),
+            Ok(instance::Instance::AlreadyRunning(running)) => {
+                if tray_only {
+                    log.write("startup: already running; exiting (tray only)");
+                } else {
+                    log.write("startup: already running; bringing its window to the front");
+                    if let Err(e) = running.activate_running() {
+                        log.write(&format!("startup: failed to notify the running app: {e}"));
+                    }
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                // 判定できなくても起動は続ける
+                log.write(&format!("startup: single instance check failed: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let activation = guard.as_ref().and_then(instance::Guard::activation_event);
+
+    let mut app = App::new(arg, Places::default_locations(), log);
+    app.start_hidden = tray_only;
+    // ウィンドウのアイコンはトレイと同じ図案にする
+    let icon_size = 64;
+    let icon = egui::IconData {
+        rgba: icon::keyboard_rgba(icon_size),
+        width: icon_size,
+        height: icon_size,
+    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([960.0, 600.0])
+        .with_icon(icon);
+    if tray_only {
+        // 最初のフレームを描くまでの一瞬に表示されても、前面を奪わないようにする
+        viewport = viewport.with_active(false);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 600.0]),
+        viewport,
         ..Default::default()
     };
-    eframe::run_native("Keymap Studio", options, Box::new(|_cc| Ok(Box::new(app))))
+    // `guard` は main を抜けるまで(ウィンドウを閉じて run_native が戻るまで)持っておく
+    eframe::run_native(
+        "Keymap Studio",
+        options,
+        Box::new(move |cc| {
+            app.start_resident(&cc.egui_ctx, activation);
+            Ok(Box::new(app))
+        }),
+    )
 }
 
 /// 設定ファイルを読めなかった理由。
@@ -198,6 +261,8 @@ struct Places {
     backup_dir: Option<PathBuf>,
     /// キーマップを置くフォルダ(exe と同じフォルダの `keymaps`。§4.5.1)
     keymaps_dir: Option<PathBuf>,
+    /// 本アプリの設定ファイル(exe と同じフォルダの `keymap-studio.settings.json`。§4.5.2)
+    settings_path: Option<PathBuf>,
 }
 
 impl Places {
@@ -207,6 +272,7 @@ impl Places {
             initial_backup_dir: initial_backup::default_dir(),
             backup_dir: save::default_backup_dir(),
             keymaps_dir: keymap::default_dir(),
+            settings_path: app_settings::default_path(),
         }
     }
 }
@@ -391,6 +457,18 @@ enum Status {
     LoadedIntoEditor(String),
     /// プリセットを今の編集に重ねた(名前)
     PresetOverlaid(String),
+    /// ホットキーを割り当てた(対象の名前、ホットキー)
+    HotkeyAssigned(String, String),
+    /// ホットキーの割り当てを外した(対象の名前)
+    HotkeyRemoved(String),
+    /// ホットキーを割り当てなかった(理由)
+    HotkeyRejected(String),
+    /// 本アプリの設定ファイルを書けなかった(詳細はそのまま表示する)
+    AppSettingsSaveFailed(String),
+    /// 本アプリの設定ファイルを読めなかったので、上書きしなかった
+    AppSettingsUnreadable,
+    /// 自動起動の登録を変えられなかった(詳細はそのまま表示する)
+    AutoStartFailed(String),
 }
 
 impl Status {
@@ -409,6 +487,8 @@ impl Status {
                 | Status::Applied(_)
                 | Status::LoadedIntoEditor(_)
                 | Status::PresetOverlaid(_)
+                | Status::HotkeyAssigned(..)
+                | Status::HotkeyRemoved(_)
         )
     }
 
@@ -477,6 +557,12 @@ impl Status {
             ),
             Status::LoadedIntoEditor(n) => with(Msg::LoadedIntoEditor, n),
             Status::PresetOverlaid(n) => with(Msg::PresetOverlaid, n),
+            Status::HotkeyAssigned(n, h) => format!("{}: {n} ({h})", tr(lang, Msg::HotkeyAssigned)),
+            Status::HotkeyRemoved(n) => with(Msg::HotkeyRemoved, n),
+            Status::HotkeyRejected(d) => d.clone(),
+            Status::AppSettingsSaveFailed(d) => with(Msg::AppSettingsSaveFailed, d),
+            Status::AppSettingsUnreadable => tr(lang, Msg::AppSettingsUnreadable).to_owned(),
+            Status::AutoStartFailed(d) => with(Msg::AutoStartFailed, d),
         }
     }
 }
@@ -500,12 +586,107 @@ enum DialogChoice {
 }
 
 /// 適用・編集に読み込むリマップ定義の出どころ。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Source {
     /// 保存したキーマップ(`keymaps` の中のファイル名)
     Keymap(String),
     /// 同梱のプリセット
     Preset(preset::PresetId),
+}
+
+impl Source {
+    /// 本アプリの設定でホットキーを割り当てる対象としての表し方。
+    fn target(&self) -> Target {
+        match self {
+            Source::Keymap(file) => Target::Keymap(file.clone()),
+            Source::Preset(id) => Target::Preset(id.id().to_owned()),
+        }
+    }
+
+    /// 設定の対象から引く。知らないプリセットの ID なら `None`。
+    fn from_target(target: &Target) -> Option<Source> {
+        match target {
+            Target::Keymap(file) => Some(Source::Keymap(file.clone())),
+            Target::Preset(id) => preset::PresetId::from_id(id).map(Source::Preset),
+        }
+    }
+}
+
+/// ホットキーを取り込むダイアログ(§4.5.2)。
+struct HotkeyDialog {
+    source: Source,
+    /// 対象の表示名
+    name: String,
+    /// 最後に押された組み合わせ(Win は含まない)
+    captured: Option<Hotkey>,
+    /// Win を加える(Win との組み合わせはウィンドウに届かないことが多いため、チェックで指定する)
+    win: bool,
+}
+
+impl HotkeyDialog {
+    /// 割り当てる組み合わせ。
+    fn hotkey(&self) -> Option<Hotkey> {
+        self.captured.map(|h| Hotkey { win: self.win, ..h })
+    }
+}
+
+/// ホットキー・トレイのメニューでの切り替えの結果(§4.5.2)。通知の文言の元にする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SwitchOutcome {
+    Switched {
+        name: String,
+        /// 未保存の編集を破棄した
+        discarded: bool,
+        /// 保存したが PowerToys への通知に失敗した(理由)
+        not_applied: Option<String>,
+    },
+    /// 切り替えなかった(理由)
+    Failed { name: String, reason: String },
+}
+
+impl SwitchOutcome {
+    /// 通知の文言。
+    fn notification(&self, lang: Lang) -> tray::Notification {
+        let title = tr(lang, Msg::NotificationTitle).to_owned();
+        match self {
+            SwitchOutcome::Switched {
+                name,
+                discarded,
+                not_applied,
+            } => {
+                let mut body = fill(tr(lang, Msg::SwitchedTo), name);
+                if *discarded {
+                    body.push('\n');
+                    body.push_str(tr(lang, Msg::SwitchDiscardedUnsaved));
+                }
+                if let Some(reason) = not_applied {
+                    body.push('\n');
+                    body.push_str(&format!("{}: {reason}", tr(lang, Msg::SavedNotApplied)));
+                }
+                tray::Notification {
+                    title,
+                    body,
+                    warning: not_applied.is_some(),
+                }
+            }
+            SwitchOutcome::Failed { name, reason } => tray::Notification {
+                title,
+                body: format!("{}\n{reason}", fill(tr(lang, Msg::SwitchFailed), name)),
+                warning: true,
+            },
+        }
+    }
+
+    /// 通知を出すか。通知をオフにしていても、切り替えられなかったことと反映されていない
+    /// 可能性は知らせる(ウィンドウを隠していると、ほかに気づく手段がないため)。
+    fn should_notify(&self, notifications_enabled: bool) -> bool {
+        match self {
+            SwitchOutcome::Switched { not_applied, .. } => {
+                notifications_enabled || not_applied.is_some()
+            }
+            SwitchOutcome::Failed { .. } => true,
+        }
+    }
 }
 
 /// キーマップの操作の確認・名前の入力のダイアログ。
@@ -552,6 +733,11 @@ enum PanelAction {
     Delete(String),
     Export(String),
     Overlay(preset::PresetId),
+    /// ホットキーを取り込むダイアログを開く
+    SetHotkey(Source),
+    RemoveHotkey(Source),
+    SetAutoStart(bool),
+    SetNotifications(bool),
 }
 
 struct App {
@@ -585,6 +771,26 @@ struct App {
     keymap_dialog: Option<KeymapDialog>,
     /// 未保存の変更があっても閉じてよい(確認ダイアログで保存または破棄を選んだ)
     allow_close: bool,
+    /// 本アプリの設定(§4.5.2)。引数でファイルを指定して起動したときは読まず、書かない
+    settings: AppSettings,
+    /// 本アプリの設定ファイルを読めなかった(詳細)。直すか消すまで上書きしない
+    settings_error: Option<String>,
+    /// ホットキーを取り込むダイアログ
+    hotkey_dialog: Option<HotkeyDialog>,
+    /// タスクトレイとホットキー(Windows で、引数でファイルを指定していないとき)
+    resident: Option<tray::Resident>,
+    /// 常駐できなかった理由(画面に出す)
+    resident_error: Option<String>,
+    /// 最後にトレイへ送ったメニュー
+    sent_menu: Option<tray::Menu>,
+    /// 最後に登録を頼んだホットキー
+    sent_hotkeys: Option<Vec<(Source, Hotkey)>>,
+    /// 登録できなかったホットキー(対象と理由)
+    hotkey_failures: Vec<(Source, String)>,
+    /// トレイのメニューの「終了」で閉じようとしている(× ボタンでは隠すだけ)
+    quitting: bool,
+    /// トレイだけで起動したので、最初に描くフレームでウィンドウを隠す
+    start_hidden: bool,
 }
 
 impl App {
@@ -594,6 +800,17 @@ impl App {
         let opened = match arg {
             Some(p) => Opened::argument(p, &log),
             None => Opened::powertoys(&places, &log),
+        };
+        // 本アプリの設定。読めなければ既定の設定で動き、ファイルは上書きしない
+        let (settings, settings_error) = match (&places.settings_path, from_argument) {
+            (Some(path), false) => match app_settings::load(path) {
+                Ok(s) => (s, None),
+                Err(e) => {
+                    log.write(&format!("app settings: failed to read: {e}"));
+                    (AppSettings::default(), Some(e))
+                }
+            },
+            _ => (AppSettings::default(), None),
         };
         let mut app = Self {
             lang: Lang::default(),
@@ -614,6 +831,16 @@ impl App {
             dialog: None,
             keymap_dialog: None,
             allow_close: false,
+            settings,
+            settings_error,
+            hotkey_dialog: None,
+            resident: None,
+            resident_error: None,
+            sent_menu: None,
+            sent_hotkeys: None,
+            hotkey_failures: Vec::new(),
+            quitting: false,
+            start_hidden: false,
         };
         app.refresh_keymaps();
         app
@@ -726,6 +953,39 @@ impl App {
         };
         self.keymaps = entries;
         self.unreadable_keymaps = unreadable;
+        self.prune_hotkeys();
+    }
+
+    /// 削除されたキーマップ(ファイルがなくなったもの)のホットキーの割り当てを外す(§4.5.2)。
+    /// ホットキーはファイル名で対応づけているため。
+    fn prune_hotkeys(&mut self) {
+        if self.from_argument || self.settings_error.is_some() {
+            return;
+        }
+        let Some(dir) = self.places.keymaps_dir.clone() else {
+            return;
+        };
+        // フォルダそのものが無い・一覧を読めないときは、消えたのかどうか分からないので外さない
+        if std::fs::read_dir(&dir).is_err() {
+            return;
+        }
+        let mut settings = self.settings.clone();
+        let exists = |file: &str| keymap::is_plain_file_name(file) && dir.join(file).is_file();
+        if settings.prune_keymaps(exists) {
+            self.store_settings("hotkey prune", settings);
+        }
+    }
+
+    /// 新しく作ったキーマップのファイル `file` に、前に同じ名前だったファイルの割り当てが
+    /// 残っていれば外す(新しいキーマップは割り当てなしで始める)。
+    fn clear_stale_hotkey(&mut self, file: &str) {
+        let target = Target::Keymap(file.to_owned());
+        if self.from_argument || self.settings.hotkey(&target).is_none() {
+            return;
+        }
+        let mut settings = self.settings.clone();
+        settings.unassign(&target);
+        self.store_settings("hotkey clear stale", settings);
     }
 
     /// キーマップのファイルを操作し、結果を `status` に入れて一覧を読み直す。
@@ -745,10 +1005,14 @@ impl App {
             return;
         };
         let k = keymap::KeymapFile::new(name.trim(), &doc.config);
+        let mut created = None;
         self.keymap_op("keymap save", |store| {
-            store.create(&k)?;
+            created = Some(store.create(&k)?);
             Ok(Status::KeymapSaved(k.name.clone()))
         });
+        if let Some(file) = created {
+            self.clear_stale_hotkey(&file);
+        }
     }
 
     /// キーマップ `file` を今の内容で上書きする。
@@ -789,11 +1053,18 @@ impl App {
     fn import_keymap(&mut self, src: &Path) {
         let existing = self.keymaps.clone();
         let what = format!("keymap import {}", src.display());
+        let mut created = None;
         self.keymap_op(&what, |store| match store.import(src, &existing) {
-            Ok(e) => Ok(Status::KeymapImported(e.keymap.name)),
+            Ok(e) => {
+                created = Some(e.file_name);
+                Ok(Status::KeymapImported(e.keymap.name))
+            }
             Err(keymap::ImportError::Invalid(reason)) => Ok(Status::ImportRejected(reason)),
             Err(keymap::ImportError::Io(d)) => Err(d),
         });
+        if let Some(file) = created {
+            self.clear_stale_hotkey(&file);
+        }
     }
 
     /// 一覧にあるキーマップの名前(なければファイル名)。
@@ -912,6 +1183,422 @@ impl App {
         }
     }
 
+    // ---- 常駐・ホットキー・自動起動(§4.5・§4.5.2) ----
+
+    /// 常駐・ホットキー・自動起動の対象か(引数でファイルを指定した起動は対象外)。
+    fn is_resident_mode(&self) -> bool {
+        !self.from_argument
+    }
+
+    /// タスクトレイとホットキーのスレッドを立て、自動起動の登録を設定に合わせる。
+    /// `activation` は後から起動した側からの知らせを待つイベント。
+    fn start_resident(&mut self, ctx: &egui::Context, activation: Option<usize>) {
+        if !self.is_resident_mode() {
+            return;
+        }
+        match tray::Resident::start(ctx.clone(), activation, self.log.clone()) {
+            Ok(r) => {
+                self.log.write("tray: started");
+                self.resident = Some(r);
+            }
+            Err(e) => {
+                self.log.write(&format!("tray: not available: {e}"));
+                self.resident_error = Some(e);
+                // トレイがないと隠したウィンドウを開く手段がないので、トレイだけの起動でも表示する
+                self.start_hidden = false;
+            }
+        }
+        // 設定を読めなかったときは、ユーザーの意図が分からないので登録を変えない
+        if self.settings_error.is_none() {
+            self.sync_autostart(false);
+        }
+    }
+
+    /// 自動起動の登録を設定に合わせる(有効なら今の exe のパスにする)。失敗はログに残し、
+    /// `report` なら画面にも出す。
+    fn sync_autostart(&mut self, report: bool) {
+        match autostart::sync(self.settings.auto_start) {
+            Ok(autostart::Synced::Registered(v)) => {
+                self.log.write(&format!("autostart: registered: {v}"));
+            }
+            Ok(autostart::Synced::Removed) => self.log.write("autostart: removed"),
+            Ok(autostart::Synced::Unchanged | autostart::Synced::Unsupported) => {}
+            Err(e) => {
+                if report {
+                    self.set_status("autostart", Status::AutoStartFailed(e));
+                } else {
+                    self.log.write(&format!("autostart: failed: {e}"));
+                }
+            }
+        }
+    }
+
+    /// 本アプリの設定を `new` にしてファイルに書く。書けたら `true`。
+    ///
+    /// 引数でファイルを指定した起動では書かない。設定ファイルを読めなかったときは、
+    /// 中身を失わないよう上書きしない。
+    fn store_settings(&mut self, what: &str, new: AppSettings) -> bool {
+        if !self.is_resident_mode() {
+            return false;
+        }
+        if self.settings_error.is_some() {
+            self.set_status(what, Status::AppSettingsUnreadable);
+            return false;
+        }
+        let Some(path) = self.places.settings_path.clone() else {
+            let detail = tr(Lang::En, Msg::DataDirNotFound).to_owned();
+            self.set_status(what, Status::AppSettingsSaveFailed(detail));
+            return false;
+        };
+        match app_settings::store(&path, &new) {
+            Ok(()) => {
+                self.settings = new;
+                self.log.write(&format!("{what}: saved {}", path.display()));
+                true
+            }
+            Err(e) => {
+                self.set_status(what, Status::AppSettingsSaveFailed(e));
+                false
+            }
+        }
+    }
+
+    /// `source` にホットキーを割り当てる。本アプリの中で重複するものや、修飾キーを含まないものは
+    /// 拒否する。
+    fn assign_hotkey(&mut self, source: &Source, hotkey: Hotkey) {
+        let name = self.source_name(source);
+        let mut settings = self.settings.clone();
+        match settings.assign(&source.target(), hotkey) {
+            Ok(()) => {
+                if self.store_settings("hotkey assign", settings) {
+                    self.set_status(
+                        "hotkey assign",
+                        Status::HotkeyAssigned(name, hotkey.format()),
+                    );
+                }
+            }
+            Err(e) => {
+                let reason = self.assign_error_text(self.lang, &e);
+                self.set_status("hotkey assign", Status::HotkeyRejected(reason));
+            }
+        }
+    }
+
+    fn unassign_hotkey(&mut self, source: &Source) {
+        let name = self.source_name(source);
+        let mut settings = self.settings.clone();
+        if settings.unassign(&source.target()) && self.store_settings("hotkey remove", settings) {
+            self.set_status("hotkey remove", Status::HotkeyRemoved(name));
+        }
+    }
+
+    /// 割り当てを受け付けなかった理由の文。
+    fn assign_error_text(&self, lang: Lang, e: &AssignError) -> String {
+        match e {
+            AssignError::Invalid(hotkey::Invalid::NoModifier) => {
+                tr(lang, Msg::HotkeyNeedsModifier).to_owned()
+            }
+            AssignError::Invalid(hotkey::Invalid::UnsupportedKey) => {
+                tr(lang, Msg::HotkeyUnsupportedKey).to_owned()
+            }
+            AssignError::Taken(holder) => {
+                format!(
+                    "{}: {}",
+                    tr(lang, Msg::HotkeyTaken),
+                    self.target_name(lang, holder)
+                )
+            }
+        }
+    }
+
+    /// ホットキーの割り当ての対象の表示名。キーマップは名前(一覧に無ければファイル名)、
+    /// プリセットは名前、知らないプリセットの ID はそのことと ID。
+    fn target_name(&self, lang: Lang, target: &Target) -> String {
+        match (Source::from_target(target), target) {
+            (Some(source), _) => self.source_name(&source),
+            (None, Target::Preset(id)) => format!("{}: {id}", tr(lang, Msg::UnknownPreset)),
+            (None, Target::Keymap(file)) => file.clone(),
+        }
+    }
+
+    /// 自動起動の有効・無効を変え、登録を合わせる。
+    fn set_auto_start(&mut self, enabled: bool) {
+        let mut settings = self.settings.clone();
+        settings.auto_start = enabled;
+        if self.store_settings("autostart setting", settings) {
+            self.sync_autostart(true);
+        }
+    }
+
+    fn set_notifications(&mut self, enabled: bool) {
+        let mut settings = self.settings.clone();
+        settings.notifications = enabled;
+        self.store_settings("notifications setting", settings);
+    }
+
+    /// ホットキー・トレイのメニューから `source` に切り替える(§4.5.2)。
+    ///
+    /// 「適用」と同じ処理([`App::apply`])を通す。未保存の編集があっても切り替え、破棄する。
+    /// 適用できないとき(初回のバックアップに失敗しているなど)は切り替えない。
+    ///
+    /// 画面の「適用」と違い、適用の直前に定義ファイルを読み直す。外部で変更されたあとも、外部の
+    /// 変更の検知で失敗し続けないようにするため(置き換える前の内容は世代バックアップに残る)。
+    /// 読み直したあとに切り替えられなかったとき、未保存の編集があれば、切り替える前の状態
+    /// (編集と、読み込んだ時点の内容)に丸ごと戻す。編集を残しつつ、あとで Save したときに外部の
+    /// 変更の検知(§4.8)が働くようにするため。未保存の編集がなければ、読み直した内容のままにする。
+    fn switch_to(&mut self, source: &Source) -> SwitchOutcome {
+        let lang = self.lang;
+        let name = self.source_name(source);
+        if let Some(reason) = self.apply_unavailable(lang) {
+            let outcome = SwitchOutcome::Failed {
+                name,
+                reason: reason.to_owned(),
+            };
+            self.log.write(&format!("switch: not switched: {reason}"));
+            return outcome;
+        }
+        let dirty = self.is_dirty();
+        let Some(path) = self.path.clone() else {
+            // apply_unavailable で確かめているので起こらない
+            return SwitchOutcome::Failed {
+                name,
+                reason: tr(lang, Msg::NoConfigLoaded).to_owned(),
+            };
+        };
+        let fresh = match Document::load(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.log
+                    .write(&format!("switch: not switched: failed to reload: {e}"));
+                return SwitchOutcome::Failed {
+                    name,
+                    reason: format!("{}: {e}", tr(lang, Msg::ReloadFailed)),
+                };
+            }
+        };
+        let previous = std::mem::replace(&mut self.doc, Ok(fresh));
+        self.status = None;
+        self.apply(source);
+        let outcome = match &self.status {
+            Some(Status::Applied(n)) => SwitchOutcome::Switched {
+                name: n.clone(),
+                discarded: dirty,
+                not_applied: None,
+            },
+            Some(Status::AppliedNotApplied(n, e)) => SwitchOutcome::Switched {
+                name: n.clone(),
+                discarded: dirty,
+                not_applied: Some(signal_detail(lang, e)),
+            },
+            Some(other) => SwitchOutcome::Failed {
+                name,
+                reason: other.message(lang),
+            },
+            // キーマップのフォルダが分からないと、適用は理由を残さずに戻る
+            None => SwitchOutcome::Failed {
+                name,
+                reason: tr(lang, Msg::KeymapDirNotFound).to_owned(),
+            },
+        };
+        if matches!(outcome, SwitchOutcome::Failed { .. }) && dirty {
+            // 切り替えなかったので、未保存の編集を読み込んだ時点の内容ごと戻す
+            self.doc = previous;
+        }
+        if matches!(outcome, SwitchOutcome::Switched { .. }) {
+            // 今の内容での上書きなどの確認は、切り替えたあとの内容で実行されないよう閉じる。
+            // ホットキーの取り込みダイアログは、開いている間ホットキーが効かないので残す
+            self.keymap_dialog = None;
+            // 未保存の編集についての確認は意味がなくなった
+            if matches!(
+                self.dialog,
+                Some(Dialog::CloseWithUnsaved | Dialog::DiscardAndReload)
+            ) {
+                self.dialog = None;
+                self.quitting = false;
+            }
+        }
+        outcome
+    }
+
+    /// トレイアイコンを出せているか(出せていなければ × で隠さない。§4.5.2)。
+    fn tray_visible(&self) -> bool {
+        self.resident
+            .as_ref()
+            .is_some_and(tray::Resident::icon_visible)
+    }
+
+    /// ウィンドウを閉じる要求(× ボタン、トレイの「終了」)を扱う。
+    ///
+    /// トレイアイコンを出せていれば、× はウィンドウを隠してトレイに残す(編集内容は保持する)。
+    /// ホットキーの取り込みダイアログは閉じる(開いたままだとホットキーが止まったままになる)。
+    /// 「終了」のとき、またはトレイアイコンを出せていないときは、未保存の編集があれば確認する。
+    fn on_close_requested(&mut self, ctx: &egui::Context, tray_visible: bool) {
+        if tray_visible && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.hotkey_dialog = None;
+        } else if self.is_dirty() && !self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            App::show_window(ctx);
+            self.dialog = Some(Dialog::CloseWithUnsaved);
+            self.keymap_dialog = None;
+            self.hotkey_dialog = None;
+        }
+    }
+
+    /// ウィンドウを出して前面に持ってくる。
+    fn show_window(ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// トレイのスレッドからの知らせを処理する。
+    fn handle_resident_events(&mut self, ctx: &egui::Context) {
+        let mut events = Vec::new();
+        if let Some(r) = &self.resident {
+            while let Some(e) = r.try_recv() {
+                events.push(e);
+            }
+        }
+        for event in events {
+            match event {
+                tray::Event::OpenWindow => App::show_window(ctx),
+                tray::Event::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                tray::Event::Switch(source) => {
+                    let outcome = self.switch_to(&source);
+                    if outcome.should_notify(self.settings.notifications)
+                        && let Some(r) = &self.resident
+                    {
+                        r.notify(outcome.notification(self.lang));
+                    }
+                }
+                tray::Event::HotkeysRegistered(results) => {
+                    self.hotkey_failures = results
+                        .into_iter()
+                        .filter_map(|(s, r)| r.err().map(|e| (s, e)))
+                        .collect();
+                    for (s, e) in &self.hotkey_failures {
+                        self.log
+                            .write(&format!("hotkey: failed to register for {s:?}: {e}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// 登録するホットキー。ホットキーを取り込んでいる間は、押した組み合わせが登録済みの
+    /// ホットキーとして奪われないよう、何も登録しない。対象がないもの(読めない設定、知らない
+    /// プリセット、なくなったキーマップ)は除く。
+    fn active_hotkeys(&self) -> Vec<(Source, Hotkey)> {
+        if self.hotkey_dialog.is_some() {
+            return Vec::new();
+        }
+        self.settings
+            .assignments()
+            .into_iter()
+            .filter_map(|(t, h)| Some((Source::from_target(&t)?, h)))
+            .filter(|(s, _)| match s {
+                Source::Keymap(file) => {
+                    self.keymaps.iter().any(|e| &e.file_name == file)
+                        || self.unreadable_keymaps.iter().any(|u| &u.file_name == file)
+                }
+                Source::Preset(_) => true,
+            })
+            .collect()
+    }
+
+    /// トレイのメニューとツールチップ。今の PowerToys の内容と一致するものにチェックを付ける。
+    fn tray_menu(&self) -> tray::Menu {
+        let lang = self.lang;
+        let saved = self.doc.as_ref().ok().map(|d| &d.saved_config);
+        let in_use = |def: &Config| saved.is_some_and(|c| keymap::same_remaps(def, c));
+        let item = |source: Source, label: String, def: &Config| tray::MenuItem {
+            label,
+            hotkey: self.settings.hotkey(&source.target()).map(|h| h.format()),
+            checked: in_use(def),
+            source,
+        };
+        let keymaps: Vec<tray::MenuItem> = self
+            .keymaps
+            .iter()
+            .map(|e| {
+                let source = Source::Keymap(e.file_name.clone());
+                item(source, e.keymap.name.clone(), &e.keymap.definition)
+            })
+            .collect();
+        let presets: Vec<tray::MenuItem> = preset::PresetId::ALL
+            .iter()
+            .map(|&id| {
+                let label = tr(lang, preset_msg(id)).to_owned();
+                item(Source::Preset(id), label, &id.definition())
+            })
+            .collect();
+        let tooltip = if saved.is_none() {
+            tr(lang, Msg::TrayTooltipNotLoaded).to_owned()
+        } else {
+            let names: Vec<&str> = keymaps
+                .iter()
+                .chain(&presets)
+                .filter(|i| i.checked)
+                .map(|i| i.label.as_str())
+                .collect();
+            if names.is_empty() {
+                tr(lang, Msg::TrayTooltipNoneInUse).to_owned()
+            } else {
+                fill(tr(lang, Msg::TrayTooltipInUse), &names.join(", "))
+            }
+        };
+        tray::Menu {
+            tooltip,
+            open_window: tr(lang, Msg::TrayOpenWindow).to_owned(),
+            exit: tr(lang, Msg::TrayExit).to_owned(),
+            sections: vec![
+                tray::MenuSection {
+                    heading: tr(lang, Msg::KeymapsHeading).to_owned(),
+                    empty: tr(lang, Msg::NoKeymaps).to_owned(),
+                    items: keymaps,
+                },
+                tray::MenuSection {
+                    heading: tr(lang, Msg::PresetsHeading).to_owned(),
+                    empty: String::new(),
+                    items: presets,
+                },
+            ],
+        }
+    }
+
+    /// トレイのメニューと、登録するホットキーが変わっていればスレッドに送る。
+    fn sync_resident(&mut self) {
+        if self.resident.is_none() {
+            return;
+        }
+        let hotkeys = self.active_hotkeys();
+        let menu = self.tray_menu();
+        let Some(r) = &self.resident else {
+            return;
+        };
+        if self.sent_hotkeys.as_ref() != Some(&hotkeys) {
+            r.set_hotkeys(hotkeys.clone());
+            self.sent_hotkeys = Some(hotkeys);
+        }
+        if self.sent_menu.as_ref() != Some(&menu) {
+            r.set_menu(menu.clone());
+            self.sent_menu = Some(menu);
+        }
+    }
+
+    /// `source` のホットキーが登録できなかった理由。
+    fn hotkey_failure(&self, source: &Source) -> Option<&str> {
+        self.hotkey_failures
+            .iter()
+            .find(|(s, _)| s == source)
+            .map(|(_, e)| e.as_str())
+    }
+
     /// キーマップとプリセットの一覧(§4.5.1・§4.6)。押された操作を実行する。
     /// `frame` はファイルのダイアログの親にするウィンドウ。
     fn keymaps_panel(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
@@ -920,6 +1607,15 @@ impl App {
         let apply_reason = self.apply_unavailable(lang);
         let saved_config = self.doc.as_ref().ok().map(|d| &d.saved_config);
         let in_use = |def: &Config| saved_config.is_some_and(|c| keymap::same_remaps(def, c));
+        let resident = self.is_resident_mode();
+        let settings = &self.settings;
+        let row_hotkey = |ui: &mut egui::Ui, source: Source, actions: &mut Vec<PanelAction>| {
+            if resident {
+                let hotkey = settings.hotkey(&source.target());
+                let failure = self.hotkey_failure(&source);
+                hotkey_row(ui, lang, hotkey, failure, source, actions);
+            }
+        };
         let mut actions = Vec::new();
 
         ui.heading(tr(lang, Msg::KeymapsHeading));
@@ -972,6 +1668,7 @@ impl App {
                                 actions.push(PanelAction::Export(file.clone()));
                             }
                         });
+                        row_hotkey(ui, Source::Keymap(file.clone()), &mut actions);
                     });
                 }
                 if !self.unreadable_keymaps.is_empty() {
@@ -1006,6 +1703,7 @@ impl App {
                                 actions.push(PanelAction::Overlay(id));
                             }
                         });
+                        row_hotkey(ui, Source::Preset(id), &mut actions);
                     });
                 }
                 ui.label(
@@ -1013,6 +1711,11 @@ impl App {
                         .small()
                         .color(ui.visuals().warn_fg_color),
                 );
+                if resident {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    self.resident_settings(ui, &mut actions);
+                }
             });
 
         for action in actions {
@@ -1076,6 +1779,137 @@ impl App {
                 }
             }
             PanelAction::Overlay(id) => self.overlay_preset(id),
+            PanelAction::SetHotkey(source) => {
+                let name = self.source_name(&source);
+                let current = self.settings.hotkey(&source.target());
+                self.hotkey_dialog = Some(HotkeyDialog {
+                    source,
+                    name,
+                    captured: current.map(|h| Hotkey { win: false, ..h }),
+                    win: current.is_some_and(|h| h.win),
+                });
+            }
+            PanelAction::RemoveHotkey(source) => self.unassign_hotkey(&source),
+            PanelAction::SetAutoStart(enabled) => self.set_auto_start(enabled),
+            PanelAction::SetNotifications(enabled) => self.set_notifications(enabled),
+        }
+    }
+
+    /// 常駐・自動起動・通知の設定の欄(§4.5・§4.5.2)。
+    fn resident_settings(&self, ui: &mut egui::Ui, actions: &mut Vec<PanelAction>) {
+        let lang = self.lang;
+        ui.strong(tr(lang, Msg::ResidentHeading));
+        if let Some(e) = &self.settings_error {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("{}: {e}", tr(lang, Msg::AppSettingsUnreadable)),
+            );
+        }
+        if let Some(e) = &self.resident_error {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("{}: {e}", tr(lang, Msg::ResidentUnavailable)),
+            );
+        }
+        let mut auto_start = self.settings.auto_start;
+        if ui
+            .checkbox(&mut auto_start, tr(lang, Msg::AutoStartOption))
+            .changed()
+        {
+            actions.push(PanelAction::SetAutoStart(auto_start));
+        }
+        let mut notifications = self.settings.notifications;
+        if ui
+            .checkbox(&mut notifications, tr(lang, Msg::NotificationsOption))
+            .changed()
+        {
+            actions.push(PanelAction::SetNotifications(notifications));
+        }
+    }
+
+    /// ホットキーを取り込むダイアログ(§4.5.2)。押された組み合わせを取り込み、修飾キーを含まない
+    /// ものや本アプリの中で重複するものは理由を出して割り当てられないようにする。
+    fn show_hotkey_dialog(&mut self, ctx: &egui::Context) {
+        let lang = self.lang;
+        if self.hotkey_dialog.is_none() {
+            return;
+        }
+        // 押された組み合わせ。文字としてのキー(配列に合わせた VK)で引けなければ、物理的な位置で引く
+        let pressed = ctx.input(|i| {
+            i.events.iter().rev().find_map(|e| match e {
+                egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => Hotkey::from_egui(*key, *modifiers)
+                    .or_else(|| physical_key.and_then(|p| Hotkey::from_egui(p, *modifiers))),
+                _ => None,
+            })
+        });
+        let Some(dialog) = &mut self.hotkey_dialog else {
+            return;
+        };
+        if let Some(h) = pressed {
+            dialog.captured = Some(h);
+        }
+        let candidate = dialog.hotkey();
+        let target = dialog.source.target();
+        let problem = candidate.and_then(|h| match h.validate() {
+            Err(e) => Some(AssignError::Invalid(e)),
+            Ok(()) => self.settings.holder_of(h, &target).map(AssignError::Taken),
+        });
+        let problem_text = problem.as_ref().map(|e| self.assign_error_text(lang, e));
+        let Some(dialog) = &mut self.hotkey_dialog else {
+            return;
+        };
+        let mut result: Option<bool> = None;
+        let response = egui::Modal::new(egui::Id::unique("hotkey_dialog")).show(ctx, |ui| {
+            ui.set_max_width(440.0);
+            ui.label(tr(lang, Msg::HotkeyPrompt));
+            ui.strong(&dialog.name);
+            ui.add_space(8.0);
+            match candidate {
+                Some(h) => ui.heading(h.format()),
+                None => ui.weak(tr(lang, Msg::HotkeyWaiting)),
+            };
+            ui.checkbox(&mut dialog.win, tr(lang, Msg::HotkeyAddWin))
+                .on_hover_text(tr(lang, Msg::HotkeyWinNote));
+            if let Some(text) = &problem_text {
+                ui.colored_label(ui.visuals().error_fg_color, text);
+            }
+            ui.label(
+                egui::RichText::new(tr(lang, Msg::HotkeysPaused))
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let ok = candidate.is_some() && problem_text.is_none();
+                if ui
+                    .add_enabled(ok, egui::Button::new(tr(lang, Msg::HotkeyAssign)))
+                    .clicked()
+                {
+                    result = Some(true);
+                }
+                if ui.button(tr(lang, Msg::Cancel)).clicked() {
+                    result = Some(false);
+                }
+            });
+        });
+        // Esc や背景のクリックは取り消しとみなす
+        if result.is_none() && response.should_close() {
+            result = Some(false);
+        }
+        let Some(ok) = result else {
+            return;
+        };
+        let Some(dialog) = self.hotkey_dialog.take() else {
+            return;
+        };
+        if ok && let Some(h) = dialog.hotkey() {
+            self.assign_hotkey(&dialog.source, h);
         }
     }
 
@@ -1283,12 +2117,20 @@ impl App {
             return;
         };
         self.dialog = None;
+        self.dialog_chosen(ctx, dialog, choice);
+    }
+
+    /// 確認ダイアログで選ばれた操作を実行する。
+    fn dialog_chosen(&mut self, ctx: &egui::Context, dialog: Dialog, choice: DialogChoice) {
         match (dialog, choice) {
+            (Dialog::CloseWithUnsaved, DialogChoice::Cancel) => self.quitting = false,
             (_, DialogChoice::Cancel) => {}
             (Dialog::CloseWithUnsaved, DialogChoice::Save) => {
                 self.save();
-                // 保存に失敗したら閉じずに結果を見せる
-                if !self.is_dirty() {
+                // 保存に失敗したら閉じずに結果を見せる。「終了」もやめる(× で隠せるように戻す)
+                if self.is_dirty() {
+                    self.quitting = false;
+                } else {
                     self.allow_close = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -1308,18 +2150,26 @@ impl eframe::App for App {
     /// 閉じる要求を止める。ウィンドウが最小化されているときは `ui` が呼ばれず
     /// こちらだけが呼ばれるため、ここで扱う。確認のダイアログが見えるよう、
     /// 最小化を解いて前面に出す。
+    ///
+    /// ウィンドウを隠している間も、トレイのスレッドが再描画を要求すると呼ばれるので、トレイと
+    /// ホットキーの知らせもここで処理する(§4.5.2)。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.viewport().close_requested()) && self.is_dirty() && !self.allow_close {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            self.dialog = Some(Dialog::CloseWithUnsaved);
-            self.keymap_dialog = None;
+        self.handle_resident_events(ctx);
+        self.sync_resident();
+        if ctx.input(|i| i.viewport().close_requested()) {
+            let tray_visible = self.tray_visible();
+            self.on_close_requested(ctx, tray_visible);
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let lang = self.lang;
+        // トレイだけで起動したとき。eframe は最初のフレームを描いたあとにウィンドウを表示するので、
+        // そのフレームの指示で隠す
+        if std::mem::take(&mut self.start_hidden) {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
         // PowerToys の設定が使える状態でないときは案内だけを出す(§1.1)
         if !matches!(self.initial, InitialBackup::NotAttempted) {
             egui::Panel::right("keymaps")
@@ -1532,6 +2382,7 @@ impl eframe::App for App {
         });
         self.show_dialog(ui.ctx());
         self.show_keymap_dialog(ui.ctx());
+        self.show_hotkey_dialog(ui.ctx());
     }
 }
 
@@ -2095,6 +2946,33 @@ fn small_enabled(ui: &mut egui::Ui, enabled: bool, text: &str, lang: Lang) -> bo
         .clicked()
 }
 
+/// 一覧の行のホットキーの欄。割り当て・解除のボタンと、登録できなかったときの理由を出す。
+fn hotkey_row(
+    ui: &mut egui::Ui,
+    lang: Lang,
+    hotkey: Option<Hotkey>,
+    failure: Option<&str>,
+    source: Source,
+    actions: &mut Vec<PanelAction>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        let text = hotkey.map_or_else(|| tr(lang, Msg::HotkeyNone).to_owned(), |h| h.format());
+        ui.label(egui::RichText::new(format!("{}: {text}", tr(lang, Msg::HotkeyLabel))).small());
+        if ui.small_button(tr(lang, Msg::SetHotkey)).clicked() {
+            actions.push(PanelAction::SetHotkey(source.clone()));
+        }
+        if hotkey.is_some() && ui.small_button(tr(lang, Msg::RemoveHotkey)).clicked() {
+            actions.push(PanelAction::RemoveHotkey(source));
+        }
+    });
+    if let Some(reason) = failure {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            format!("{}: {reason}", tr(lang, Msg::HotkeyRegisterFailed)),
+        );
+    }
+}
+
 /// 「使用中」の印。
 fn in_use_badge(ui: &mut egui::Ui, lang: Lang) {
     let color = ui.visuals().selection.stroke.color;
@@ -2170,6 +3048,7 @@ mod tests {
                 initial_backup_dir: Some(data.join(initial_backup::DIR_NAME)),
                 backup_dir: Some(data.join("backups")),
                 keymaps_dir: Some(data.join(keymap::DIR_NAME)),
+                settings_path: Some(data.join(app_settings::FILE_NAME)),
             };
             Env { tmp, places }
         }
@@ -2689,6 +3568,677 @@ mod tests {
         let log = env.log_text();
         assert!(log.contains("initial backup: failed"), "{log}");
         assert!(log.contains("save: "), "{log}");
+    }
+
+    fn hk(s: &str) -> Hotkey {
+        Hotkey::parse(s).unwrap()
+    }
+
+    /// 一時ディレクトリの本アプリの設定ファイルの中身(なければ空)。
+    fn settings_text(env: &Env) -> String {
+        fs::read_to_string(env.places.settings_path.as_ref().unwrap()).unwrap_or_default()
+    }
+
+    /// E → F だけのキーマップを作り、そのファイル名を返す。
+    fn create_ef_keymap(app: &mut App) -> String {
+        let def: Config = serde_json::from_str(
+            r#"{"remapKeys":{"inProcess":[{"originalKeys":"69","newRemapKeys":"70"}]}}"#,
+        )
+        .unwrap();
+        let file = app
+            .store()
+            .unwrap()
+            .create(&keymap::KeymapFile::new("EF", &def))
+            .unwrap();
+        app.refresh_keymaps();
+        file
+    }
+
+    #[test]
+    fn switch_applies_like_apply_and_discards_unsaved_edits() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        let file = create_ef_keymap(&mut app);
+        edit_a_to_c(&mut app);
+
+        let outcome = app.switch_to(&Source::Keymap(file));
+        // テストでは PowerToys への通知をしないので、反映されていない可能性が添えられる
+        let SwitchOutcome::Switched {
+            name,
+            discarded,
+            not_applied,
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(name, "EF");
+        assert!(discarded);
+        assert!(not_applied.is_some());
+        // 「適用」と同じ: 定義ファイルを置き換え、世代バックアップを残し、未保存の編集は消える
+        let (cfg, _) = config::load(&env.km().join("default.json")).unwrap();
+        let map = matching::source_map(&cfg.remap_keys.in_process);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&KeyCode(0x45)], vec![vec![KeyCode(0x46)]]);
+        assert!(!app.is_dirty());
+        assert_eq!(
+            fs::read_dir(env.places.backup_dir.as_ref().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+        let n = outcome.notification(Lang::En);
+        assert!(n.body.starts_with("Switched to EF"), "{}", n.body);
+        assert!(n.body.contains(tr(Lang::En, Msg::SwitchDiscardedUnsaved)));
+        assert!(env.log_text().contains("apply EF to "));
+
+        // 未保存の編集がなければ、破棄したとは書かない
+        let outcome = app.switch_to(&Source::Preset(preset::PresetId::Onishi));
+        assert!(matches!(
+            &outcome,
+            SwitchOutcome::Switched {
+                discarded: false,
+                ..
+            }
+        ));
+        let n = outcome.notification(Lang::En);
+        assert!(
+            n.body.starts_with("Switched to Onishi layout"),
+            "{}",
+            n.body
+        );
+        assert!(!n.body.contains(tr(Lang::En, Msg::SwitchDiscardedUnsaved)));
+    }
+
+    #[test]
+    fn switch_is_refused_when_apply_is_unavailable() {
+        let mut env = Env::new();
+        env.install();
+        let blocker = env.tmp.path().join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        env.places.initial_backup_dir = Some(blocker.join(initial_backup::DIR_NAME));
+        let mut app = env.app(None);
+        edit_a_to_c(&mut app);
+        let outcome = app.switch_to(&Source::Preset(preset::PresetId::Onishi));
+        assert_eq!(
+            outcome,
+            SwitchOutcome::Failed {
+                name: "Onishi layout".to_owned(),
+                reason: tr(Lang::En, Msg::SaveBlockedByInitialBackup).to_owned(),
+            }
+        );
+        // 切り替えず、未保存の編集も残す
+        assert!(app.is_dirty());
+        assert_eq!(
+            fs::read_to_string(env.km().join("default.json")).unwrap(),
+            DEFAULT_JSON
+        );
+        let n = outcome.notification(Lang::En);
+        assert!(n.warning);
+        assert!(n.body.starts_with("Could not switch to Onishi layout"));
+        assert!(
+            n.body
+                .contains(tr(Lang::En, Msg::SaveBlockedByInitialBackup))
+        );
+    }
+
+    #[test]
+    fn switch_notification_texts_and_when_to_show() {
+        let lang = Lang::En;
+        let ok = SwitchOutcome::Switched {
+            name: "Gaming".into(),
+            discarded: false,
+            not_applied: None,
+        };
+        let n = ok.notification(lang);
+        assert_eq!(n.title, "Keymap Studio");
+        assert_eq!(n.body, "Switched to Gaming");
+        assert!(!n.warning);
+        // 通知をオフにすると、うまく切り替えたときは出さない
+        assert!(ok.should_notify(true));
+        assert!(!ok.should_notify(false));
+
+        let discarded = SwitchOutcome::Switched {
+            name: "Gaming".into(),
+            discarded: true,
+            not_applied: Some("not running".into()),
+        };
+        let n = discarded.notification(lang);
+        assert_eq!(
+            n.body,
+            format!(
+                "Switched to Gaming\n{}\n{}: not running",
+                tr(lang, Msg::SwitchDiscardedUnsaved),
+                tr(lang, Msg::SavedNotApplied)
+            )
+        );
+        assert!(n.warning);
+        // 反映されていない可能性と、切り替えられなかったことはオフでも知らせる
+        assert!(discarded.should_notify(false));
+        let failed = SwitchOutcome::Failed {
+            name: "Gaming".into(),
+            reason: "locked".into(),
+        };
+        assert_eq!(
+            failed.notification(lang).body,
+            "Could not switch to Gaming\nlocked"
+        );
+        assert!(failed.should_notify(false));
+    }
+
+    #[test]
+    fn hotkeys_are_saved_validated_and_deduplicated() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        let file = create_ef_keymap(&mut app);
+        let km = Source::Keymap(file.clone());
+        let onishi = Source::Preset(preset::PresetId::Onishi);
+
+        app.assign_hotkey(&km, hk("Ctrl+Alt+1"));
+        assert!(
+            matches!(&app.status, Some(Status::HotkeyAssigned(n, h)) if n == "EF" && h == "Ctrl+Alt+1")
+        );
+        app.assign_hotkey(&onishi, hk("Ctrl+Alt+O"));
+        let v: serde_json::Value = serde_json::from_str(&settings_text(&env)).unwrap();
+        assert_eq!(v["hotkeys"]["keymaps"][&file], "Ctrl+Alt+1");
+        assert_eq!(v["hotkeys"]["presets"]["onishi"], "Ctrl+Alt+O");
+
+        // 本アプリの中で重複するものは拒否し、ファイルは変えない
+        let before = settings_text(&env);
+        app.assign_hotkey(&onishi, hk("Alt+Ctrl+1"));
+        assert!(
+            matches!(&app.status, Some(Status::HotkeyRejected(r)) if r.contains("EF")),
+            "{:?}",
+            app.status.as_ref().map(|s| s.message(Lang::En))
+        );
+        // 修飾キーのないものも拒否する
+        app.assign_hotkey(
+            &onishi,
+            Hotkey {
+                vk: 0x41,
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(&app.status, Some(Status::HotkeyRejected(r)) if r == tr(Lang::En, Msg::HotkeyNeedsModifier))
+        );
+        assert_eq!(settings_text(&env), before);
+        assert_eq!(
+            app.settings.hotkey(&onishi.target()),
+            Some(hk("Ctrl+Alt+O"))
+        );
+
+        // 登録するもの(キーマップとプリセット)。取り込み中は何も登録しない
+        assert_eq!(
+            app.active_hotkeys(),
+            vec![
+                (km.clone(), hk("Ctrl+Alt+1")),
+                (onishi.clone(), hk("Ctrl+Alt+O"))
+            ]
+        );
+        app.hotkey_dialog = Some(HotkeyDialog {
+            source: km.clone(),
+            name: "EF".into(),
+            captured: None,
+            win: false,
+        });
+        assert!(app.active_hotkeys().is_empty());
+        app.hotkey_dialog = None;
+
+        app.unassign_hotkey(&onishi);
+        assert!(matches!(&app.status, Some(Status::HotkeyRemoved(n)) if n == "Onishi layout"));
+        assert_eq!(app.settings.hotkey(&onishi.target()), None);
+        assert!(!settings_text(&env).contains("onishi"));
+        assert!(env.log_text().contains("hotkey assign: saved"));
+    }
+
+    #[test]
+    fn hotkeys_follow_keymap_rename_delete_and_new_files() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        app.save_new_keymap("Mine");
+        let file = app.keymaps[0].file_name.clone();
+        let target = Target::Keymap(file.clone());
+        app.assign_hotkey(&Source::Keymap(file.clone()), hk("Ctrl+Alt+1"));
+
+        // 名前を変えてもファイル名は変わらないので、割り当ては残る
+        app.rename_keymap(&file, "Renamed");
+        assert_eq!(app.keymaps[0].file_name, file);
+        assert_eq!(app.settings.hotkey(&target), Some(hk("Ctrl+Alt+1")));
+        assert_eq!(app.tray_menu().sections[0].items[0].label, "Renamed");
+
+        // 取り込んだキーマップは割り当てなしで始まり、ほかの割り当ても変えない
+        let dest = env.tmp.path().join("exported.json");
+        app.export_keymap(&file, &dest);
+        app.import_keymap(&dest);
+        assert_eq!(app.keymaps.len(), 2);
+        let imported = app
+            .keymaps
+            .iter()
+            .find(|e| e.file_name != file)
+            .unwrap()
+            .file_name
+            .clone();
+        assert_eq!(app.settings.hotkey(&Target::Keymap(imported.clone())), None);
+        assert_eq!(app.settings.hotkey(&target), Some(hk("Ctrl+Alt+1")));
+
+        // 削除したら割り当ても外す(ファイルにも残さない)
+        app.delete_keymap(&file);
+        assert_eq!(app.settings.hotkey(&target), None);
+        assert!(!settings_text(&env).contains(&file));
+
+        // 外部で消されたファイルと同じ名前で新しく作っても、前の割り当ては引き継がない
+        app.assign_hotkey(&Source::Keymap(imported.clone()), hk("Ctrl+Alt+2"));
+        fs::remove_file(env.places.keymaps_dir.as_ref().unwrap().join(&imported)).unwrap();
+        // 取り込んだもの("Renamed (2)")と同じ名前なので、同じファイル名になる
+        app.save_new_keymap("Renamed (2)");
+        assert!(app.keymaps.iter().any(|e| e.file_name == imported));
+        assert_eq!(app.settings.hotkey(&Target::Keymap(imported)), None);
+    }
+
+    #[test]
+    fn hotkeys_of_missing_keymaps_are_pruned_at_startup() {
+        let env = Env::new();
+        env.install();
+        fs::create_dir_all(env.places.keymaps_dir.as_ref().unwrap()).unwrap();
+        let path = env.places.settings_path.clone().unwrap();
+        fs::write(
+            &path,
+            r#"{"hotkeys":{"keymaps":{"gone.json":"Ctrl+Alt+9"},"presets":{"onishi":"Ctrl+Alt+O","future":"Ctrl+Alt+F"}},"autoStart":false,"other":1}"#,
+        )
+        .unwrap();
+        let app = env.app(None);
+        assert_eq!(
+            app.settings.hotkey(&Target::Keymap("gone.json".into())),
+            None
+        );
+        let v: serde_json::Value = serde_json::from_str(&settings_text(&env)).unwrap();
+        assert_eq!(v["hotkeys"]["keymaps"], serde_json::json!({}));
+        // プリセット(知らない ID も)とほかの設定は残す
+        assert_eq!(v["hotkeys"]["presets"]["future"], "Ctrl+Alt+F");
+        assert_eq!(v["autoStart"], false);
+        assert_eq!(v["other"], 1);
+        // 知らないプリセットは登録しない
+        assert_eq!(
+            app.active_hotkeys(),
+            vec![(Source::Preset(preset::PresetId::Onishi), hk("Ctrl+Alt+O"))]
+        );
+    }
+
+    #[test]
+    fn unreadable_settings_are_not_overwritten() {
+        let env = Env::new();
+        env.install();
+        let path = env.places.settings_path.clone().unwrap();
+        fs::write(&path, "broken").unwrap();
+        let mut app = env.app(None);
+        assert!(app.settings_error.is_some());
+        app.assign_hotkey(&Source::Preset(preset::PresetId::Onishi), hk("Ctrl+Alt+O"));
+        assert!(matches!(app.status, Some(Status::AppSettingsUnreadable)));
+        app.set_notifications(false);
+        assert!(app.settings.notifications);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "broken");
+        assert!(env.log_text().contains("app settings: failed to read"));
+    }
+
+    #[test]
+    fn argument_mode_neither_reads_nor_writes_settings() {
+        let env = Env::new();
+        let path = env.places.settings_path.clone().unwrap();
+        let text = r#"{"hotkeys":{"keymaps":{"gone.json":"Ctrl+Alt+9"}},"notifications":false}"#;
+        fs::write(&path, text).unwrap();
+        let arg = env.tmp.path().join("default.json");
+        fs::write(&arg, DEFAULT_JSON).unwrap();
+        let mut app = env.app(Some(arg));
+        assert!(!app.is_resident_mode());
+        assert!(app.settings.notifications);
+        app.save_new_keymap("Mine");
+        let file = app.keymaps[0].file_name.clone();
+        app.assign_hotkey(&Source::Keymap(file.clone()), hk("Ctrl+Alt+1"));
+        app.delete_keymap(&file);
+        app.set_auto_start(false);
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        // 常駐しないので、トレイやホットキーには何も送らない
+        app.sync_resident();
+        assert!(app.sent_menu.is_none() && app.sent_hotkeys.is_none());
+    }
+
+    #[test]
+    fn tray_menu_marks_in_use_and_shows_hotkeys() {
+        let env = Env::new();
+        let app = env.app(None);
+        assert_eq!(
+            app.tray_menu().tooltip,
+            tr(Lang::En, Msg::TrayTooltipNotLoaded)
+        );
+
+        env.install();
+        let mut app = env.app(None);
+        assert_eq!(
+            app.tray_menu().tooltip,
+            tr(Lang::En, Msg::TrayTooltipNoneInUse)
+        );
+        app.save_new_keymap("Current");
+        let file = app.keymaps[0].file_name.clone();
+        app.assign_hotkey(&Source::Keymap(file.clone()), hk("Ctrl+Alt+1"));
+        let menu = app.tray_menu();
+        assert_eq!(menu.tooltip, "Keymap Studio: Current");
+        let [keymaps, presets] = &menu.sections[..] else {
+            panic!("{menu:?}");
+        };
+        assert_eq!(keymaps.items.len(), 1);
+        assert_eq!(keymaps.items[0].source, Source::Keymap(file));
+        assert!(keymaps.items[0].checked);
+        assert_eq!(keymaps.items[0].hotkey.as_deref(), Some("Ctrl+Alt+1"));
+        assert_eq!(presets.items.len(), preset::PresetId::ALL.len());
+        assert!(!presets.items[0].checked);
+        assert_eq!(presets.items[0].hotkey, None);
+
+        // 切り替えるとチェックとツールチップが移る
+        app.switch_to(&Source::Preset(preset::PresetId::Onishi));
+        let menu = app.tray_menu();
+        assert!(!menu.sections[0].items[0].checked);
+        assert!(menu.sections[1].items[0].checked);
+        assert_eq!(menu.tooltip, "Keymap Studio: Onishi layout");
+    }
+
+    #[test]
+    fn source_and_target_convert_both_ways() {
+        for source in [
+            Source::Keymap("a.json".into()),
+            Source::Preset(preset::PresetId::Onishi),
+        ] {
+            assert_eq!(Source::from_target(&source.target()), Some(source));
+        }
+        assert_eq!(Source::from_target(&Target::Preset("unknown".into())), None);
+    }
+
+    #[test]
+    fn hotkey_dialog_combines_captured_keys_with_win() {
+        let mut d = HotkeyDialog {
+            source: Source::Preset(preset::PresetId::Onishi),
+            name: String::new(),
+            captured: None,
+            win: true,
+        };
+        assert_eq!(d.hotkey(), None);
+        d.captured = Some(Hotkey {
+            vk: 0x31,
+            ..Default::default()
+        });
+        // Win だけでも修飾キーを含むものとして受け付ける
+        assert_eq!(d.hotkey(), Some(hk("Win+1")));
+        d.win = false;
+        assert_eq!(
+            d.hotkey().unwrap().validate(),
+            Err(hotkey::Invalid::NoModifier)
+        );
+    }
+
+    #[test]
+    fn switch_reloads_the_definition_file_before_applying() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        let path = env.km().join("default.json");
+        // 読み込んだあとに外部で変更された
+        let external = r#"{"remapKeys":{"inProcess":[{"originalKeys":"71","newRemapKeys":"72"}]},"topLevel":"external"}"#;
+        fs::write(&path, external).unwrap();
+        // 画面の「適用」は外部の変更を検知して止める
+        app.apply(&Source::Preset(preset::PresetId::Onishi));
+        assert!(matches!(
+            app.status,
+            Some(Status::SaveFailed(save::SaveError::Modified))
+        ));
+        // ホットキー・トレイからの切り替えは読み直してから適用する
+        edit_a_to_c(&mut app);
+        let outcome = app.switch_to(&Source::Preset(preset::PresetId::Onishi));
+        assert!(
+            matches!(
+                &outcome,
+                SwitchOutcome::Switched {
+                    discarded: true,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        let (cfg, _) = config::load(&path).unwrap();
+        assert!(keymap::same_remaps(
+            &cfg,
+            &preset::PresetId::Onishi.definition()
+        ));
+        // 4 つの区分以外は、読み直した内容のものを残す
+        assert_eq!(cfg.extra["topLevel"], "external");
+        // 置き換える前の(外部で変更された)内容は世代バックアップに残る
+        let backups: Vec<_> = fs::read_dir(env.places.backup_dir.as_ref().unwrap())
+            .unwrap()
+            .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(backups, vec![external.to_owned()]);
+        assert!(!app.is_dirty());
+        let menu = app.tray_menu();
+        assert!(menu.sections[1].items[0].checked);
+        assert_eq!(menu.tooltip, "Keymap Studio: Onishi layout");
+    }
+
+    #[test]
+    fn failed_switch_keeps_edits_and_save_still_detects_external_changes() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        app.save_new_keymap("Current");
+        let path = env.km().join("default.json");
+        let external = r#"{"remapKeys":{"inProcess":[]}}"#;
+        // 外部で変更されてから、読めないキーマップへ切り替えようとする
+        fs::write(&path, external).unwrap();
+        edit_a_to_c(&mut app);
+        let outcome = app.switch_to(&Source::Keymap("missing.json".into()));
+        assert!(
+            matches!(outcome, SwitchOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        // 切り替える前の状態に丸ごと戻る: 未保存の編集が残り、保存済みの内容も元のまま
+        // (トレイのチェックとツールチップも元の内容に合う)
+        let doc = app.doc.as_ref().ok().unwrap();
+        assert_eq!(doc.snapshot, DEFAULT_JSON.as_bytes());
+        let map = matching::source_map(&doc.config.remap_keys.in_process);
+        assert_eq!(map[&KeyCode(0x41)], vec![vec![KeyCode(0x43)]]);
+        assert!(app.is_dirty());
+        assert_eq!(app.tray_menu().tooltip, "Keymap Studio: Current");
+        assert_eq!(fs::read_to_string(&path).unwrap(), external);
+        // そのあと Save しても、外部の変更を検知して上書きしない
+        app.save();
+        assert!(matches!(
+            app.status,
+            Some(Status::SaveFailed(save::SaveError::Modified))
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), external);
+        assert!(app.is_dirty());
+
+        // 未保存の編集がなければ、読み直した内容のままにする
+        let env = Env::new();
+        env.install();
+        let mut clean = env.app(None);
+        let path2 = env.km().join("default.json");
+        fs::write(&path2, external).unwrap();
+        let outcome = clean.switch_to(&Source::Keymap("missing.json".into()));
+        assert!(
+            matches!(outcome, SwitchOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        let doc = clean.doc.as_ref().ok().unwrap();
+        assert_eq!(doc.snapshot, external.as_bytes());
+        assert!(!clean.is_dirty());
+        assert_eq!(
+            clean.tray_menu().tooltip,
+            tr(Lang::En, Msg::TrayTooltipNoneInUse)
+        );
+
+        // 定義ファイルを読めなければ切り替えず、何も変えない
+        fs::write(&path, "broken").unwrap();
+        let outcome = app.switch_to(&Source::Preset(preset::PresetId::Onishi));
+        let SwitchOutcome::Failed { reason, .. } = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(
+            reason.starts_with(tr(Lang::En, Msg::ReloadFailed)),
+            "{reason}"
+        );
+        assert!(app.is_dirty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "broken");
+    }
+
+    #[test]
+    fn successful_switch_closes_keymap_dialogs_but_not_hotkey_capture() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        app.save_new_keymap("Mine");
+        let file = app.keymaps[0].file_name.clone();
+        app.keymap_dialog = Some(KeymapDialog::ConfirmOverwrite {
+            file,
+            name: "Mine".into(),
+        });
+        app.hotkey_dialog = Some(HotkeyDialog {
+            source: Source::Preset(preset::PresetId::Onishi),
+            name: String::new(),
+            captured: None,
+            win: false,
+        });
+        app.switch_to(&Source::Preset(preset::PresetId::Onishi));
+        assert!(app.keymap_dialog.is_none());
+        assert!(app.hotkey_dialog.is_some());
+
+        // 切り替えられなかったときは閉じない
+        let mut env = Env::new();
+        env.install();
+        let blocker = env.tmp.path().join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        env.places.initial_backup_dir = Some(blocker.join(initial_backup::DIR_NAME));
+        let mut app = env.app(None);
+        app.keymap_dialog = Some(KeymapDialog::SaveNew {
+            name: String::new(),
+            focus: false,
+        });
+        app.switch_to(&Source::Preset(preset::PresetId::Onishi));
+        assert!(app.keymap_dialog.is_some());
+    }
+
+    #[test]
+    fn closing_to_tray_ends_hotkey_capture() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        let onishi = Source::Preset(preset::PresetId::Onishi);
+        app.assign_hotkey(&onishi, hk("Ctrl+Alt+O"));
+        app.hotkey_dialog = Some(HotkeyDialog {
+            source: onishi.clone(),
+            name: String::new(),
+            captured: None,
+            win: false,
+        });
+        assert!(app.active_hotkeys().is_empty());
+        edit_a_to_c(&mut app);
+        let ctx = egui::Context::default();
+        // トレイアイコンがあれば × で隠す。取り込みは終わり、ホットキーは再び登録される
+        app.on_close_requested(&ctx, true);
+        assert!(app.hotkey_dialog.is_none());
+        assert!(app.dialog.is_none());
+        assert_eq!(app.active_hotkeys(), vec![(onishi, hk("Ctrl+Alt+O"))]);
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn closing_without_tray_icon_asks_about_unsaved_edits() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        let ctx = egui::Context::default();
+        // 未保存の編集がなければ何もしない(そのまま閉じる)
+        app.on_close_requested(&ctx, false);
+        assert!(app.dialog.is_none());
+        // トレイアイコンを出せていなければ、隠さずに閉じる確認へ進む
+        edit_a_to_c(&mut app);
+        app.on_close_requested(&ctx, false);
+        assert_eq!(app.dialog, Some(Dialog::CloseWithUnsaved));
+        // 「終了」のときも同じ
+        app.dialog = None;
+        app.quitting = true;
+        app.on_close_requested(&ctx, true);
+        assert_eq!(app.dialog, Some(Dialog::CloseWithUnsaved));
+    }
+
+    #[test]
+    fn quitting_is_cancelled_when_saving_fails() {
+        let mut env = Env::new();
+        env.install();
+        let blocker = env.tmp.path().join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        env.places.initial_backup_dir = Some(blocker.join(initial_backup::DIR_NAME));
+        let mut app = env.app(None);
+        edit_a_to_c(&mut app);
+        app.quitting = true;
+        let ctx = egui::Context::default();
+        app.dialog_chosen(&ctx, Dialog::CloseWithUnsaved, DialogChoice::Save);
+        assert!(app.is_dirty());
+        assert!(!app.quitting);
+        assert!(!app.allow_close);
+        // 取り消しでも終了をやめる
+        app.quitting = true;
+        app.dialog_chosen(&ctx, Dialog::CloseWithUnsaved, DialogChoice::Cancel);
+        assert!(!app.quitting);
+    }
+
+    #[test]
+    fn hotkeys_are_kept_when_keymaps_folder_is_missing() {
+        let env = Env::new();
+        env.install();
+        let path = env.places.settings_path.clone().unwrap();
+        let text = r#"{"hotkeys":{"keymaps":{"a.json":"Ctrl+Alt+1"}}}"#;
+        fs::write(&path, text).unwrap();
+        // keymaps フォルダが無い
+        let app = env.app(None);
+        assert_eq!(
+            app.settings.hotkey(&Target::Keymap("a.json".into())),
+            Some(hk("Ctrl+Alt+1"))
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        // keymaps がファイルで、一覧を読めない
+        fs::write(env.places.keymaps_dir.as_ref().unwrap(), "x").unwrap();
+        let app = env.app(None);
+        assert!(
+            app.settings
+                .hotkey(&Target::Keymap("a.json".into()))
+                .is_some()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn duplicate_messages_name_the_holder_readably() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        let file = create_ef_keymap(&mut app);
+        let lang = Lang::En;
+        let taken = |t: Target| app.assign_error_text(lang, &AssignError::Taken(t));
+        assert_eq!(taken(Target::Keymap(file)), "Already assigned to: EF");
+        assert_eq!(
+            taken(Target::Preset("onishi".into())),
+            "Already assigned to: Onishi layout"
+        );
+        assert_eq!(
+            taken(Target::Preset("future".into())),
+            "Already assigned to: Unknown preset: future"
+        );
+        // 一覧に無いキーマップはファイル名
+        assert_eq!(
+            taken(Target::Keymap("gone.json".into())),
+            "Already assigned to: gone.json"
+        );
     }
 
     #[test]

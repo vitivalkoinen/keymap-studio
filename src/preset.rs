@@ -17,6 +17,18 @@ impl PresetId {
     /// 一覧での表示順。
     pub const ALL: &[PresetId] = &[PresetId::Onishi];
 
+    /// 本アプリの設定ファイルでプリセットを指す ID(ホットキーの割り当て。§4.5.2)。変えないこと。
+    pub fn id(self) -> &'static str {
+        match self {
+            PresetId::Onishi => "onishi",
+        }
+    }
+
+    /// [`PresetId::id`] から引く。知らない ID なら `None`。
+    pub fn from_id(id: &str) -> Option<PresetId> {
+        PresetId::ALL.iter().copied().find(|p| p.id() == id)
+    }
+
     /// プリセットのリマップ定義(4 つの区分だけ)。
     pub fn definition(self) -> Config {
         match self {
@@ -77,6 +89,15 @@ fn onishi() -> Config {
 mod tests {
     use super::*;
     use crate::{keys, matching};
+
+    #[test]
+    fn ids_round_trip_and_are_unique() {
+        for &p in PresetId::ALL {
+            assert_eq!(PresetId::from_id(p.id()), Some(p));
+        }
+        assert_eq!(PresetId::Onishi.id(), "onishi");
+        assert_eq!(PresetId::from_id("unknown"), None);
+    }
 
     #[test]
     fn onishi_rows_are_well_formed() {

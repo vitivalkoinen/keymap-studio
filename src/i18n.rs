@@ -145,6 +145,39 @@ pub enum Msg {
     KeymapInvalidFormat,
     KeymapInvalidVersion,
     KeymapInvalidLayout,
+    TrayOpenWindow,
+    TrayExit,
+    TrayTooltipInUse,
+    TrayTooltipNoneInUse,
+    TrayTooltipNotLoaded,
+    NotificationTitle,
+    SwitchedTo,
+    SwitchDiscardedUnsaved,
+    SwitchFailed,
+    HotkeyLabel,
+    HotkeyNone,
+    SetHotkey,
+    RemoveHotkey,
+    HotkeyRegisterFailed,
+    HotkeyPrompt,
+    HotkeyWaiting,
+    HotkeyAddWin,
+    HotkeyWinNote,
+    HotkeyNeedsModifier,
+    HotkeyUnsupportedKey,
+    HotkeyTaken,
+    HotkeyAssign,
+    HotkeyAssigned,
+    HotkeyRemoved,
+    HotkeysPaused,
+    ResidentHeading,
+    AutoStartOption,
+    NotificationsOption,
+    ResidentUnavailable,
+    AppSettingsSaveFailed,
+    AppSettingsUnreadable,
+    AutoStartFailed,
+    UnknownPreset,
 }
 
 impl Msg {
@@ -282,7 +315,45 @@ impl Msg {
         Msg::KeymapInvalidFormat,
         Msg::KeymapInvalidVersion,
         Msg::KeymapInvalidLayout,
+        Msg::TrayOpenWindow,
+        Msg::TrayExit,
+        Msg::TrayTooltipInUse,
+        Msg::TrayTooltipNoneInUse,
+        Msg::TrayTooltipNotLoaded,
+        Msg::NotificationTitle,
+        Msg::SwitchedTo,
+        Msg::SwitchDiscardedUnsaved,
+        Msg::SwitchFailed,
+        Msg::HotkeyLabel,
+        Msg::HotkeyNone,
+        Msg::SetHotkey,
+        Msg::RemoveHotkey,
+        Msg::HotkeyRegisterFailed,
+        Msg::HotkeyPrompt,
+        Msg::HotkeyWaiting,
+        Msg::HotkeyAddWin,
+        Msg::HotkeyWinNote,
+        Msg::HotkeyNeedsModifier,
+        Msg::HotkeyUnsupportedKey,
+        Msg::HotkeyTaken,
+        Msg::HotkeyAssign,
+        Msg::HotkeyAssigned,
+        Msg::HotkeyRemoved,
+        Msg::HotkeysPaused,
+        Msg::ResidentHeading,
+        Msg::AutoStartOption,
+        Msg::NotificationsOption,
+        Msg::ResidentUnavailable,
+        Msg::AppSettingsSaveFailed,
+        Msg::AppSettingsUnreadable,
+        Msg::AutoStartFailed,
+        Msg::UnknownPreset,
     ];
+}
+
+/// 文字列の中の `{name}` を `name` に置き換える(語順が言語ごとに違う文のため)。
+pub fn fill(template: &str, name: &str) -> String {
+    template.replace("{name}", name)
 }
 
 /// `msg` を `lang` の文字列にする。
@@ -479,12 +550,60 @@ fn en(msg: Msg) -> &'static str {
         Msg::KeymapInvalidFormat => "not a Keymap Studio keymap",
         Msg::KeymapInvalidVersion => "unsupported formatVersion",
         Msg::KeymapInvalidLayout => "unsupported keyboard layout",
+        Msg::TrayOpenWindow => "Open Keymap Studio",
+        Msg::TrayExit => "Exit",
+        Msg::TrayTooltipInUse => "Keymap Studio: {name}",
+        Msg::TrayTooltipNoneInUse => "Keymap Studio: no saved keymap or preset in use",
+        Msg::TrayTooltipNotLoaded => "Keymap Studio: PowerToys remap settings are not loaded",
+        Msg::NotificationTitle => "Keymap Studio",
+        Msg::SwitchedTo => "Switched to {name}",
+        Msg::SwitchDiscardedUnsaved => "Unsaved edits in the Keymap Studio window were discarded.",
+        Msg::SwitchFailed => "Could not switch to {name}",
+        Msg::HotkeyLabel => "Hotkey",
+        Msg::HotkeyNone => "none",
+        Msg::SetHotkey => "Set hotkey…",
+        Msg::RemoveHotkey => "Remove hotkey",
+        Msg::HotkeyRegisterFailed => {
+            "This hotkey could not be registered (it may be used by another app)"
+        }
+        Msg::HotkeyPrompt => "Press the key combination to use for:",
+        Msg::HotkeyWaiting => "Waiting for a key combination…",
+        Msg::HotkeyAddWin => "Also hold Win",
+        Msg::HotkeyWinNote => {
+            "Windows usually handles combinations with the Win key itself, so they do not reach this window. To use Win, press the rest of the combination and check this box."
+        }
+        Msg::HotkeyNeedsModifier => "Include Ctrl, Alt, Shift or Win.",
+        Msg::HotkeyUnsupportedKey => "This key cannot be used for a hotkey.",
+        Msg::HotkeyTaken => "Already assigned to",
+        Msg::HotkeyAssign => "Assign",
+        Msg::HotkeyAssigned => "Assigned the hotkey",
+        Msg::HotkeyRemoved => "Removed the hotkey",
+        Msg::HotkeysPaused => "Hotkeys are paused while this dialog is open.",
+        Msg::ResidentHeading => "Tray, hotkeys and startup",
+        Msg::AutoStartOption => "Start automatically in the tray when signing in to Windows",
+        Msg::NotificationsOption => "Show a notification after switching from the tray or a hotkey",
+        Msg::ResidentUnavailable => "The tray icon and hotkeys are not available",
+        Msg::AppSettingsSaveFailed => "Failed to save the Keymap Studio settings",
+        Msg::AppSettingsUnreadable => {
+            "The Keymap Studio settings file could not be read. Changes to these settings are not saved until the file is fixed or removed"
+        }
+        Msg::AutoStartFailed => "Failed to update the startup registration",
+        Msg::UnknownPreset => "Unknown preset",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_replaces_name() {
+        assert_eq!(
+            fill(tr(Lang::En, Msg::SwitchedTo), "Gaming"),
+            "Switched to Gaming"
+        );
+        assert_eq!(fill("no placeholder", "x"), "no placeholder");
+    }
 
     #[test]
     fn english_has_all_messages() {
