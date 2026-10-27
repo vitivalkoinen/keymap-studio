@@ -7,8 +7,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// 拡張キー(矢印キーとテンキーの区別など)を示すフラグ。
-pub const EXTENDED_FLAG: u32 = 0x8000_0000;
+/// テンキー由来のキーであることを示すフラグ(PowerToys の `numpadOriginBit`)。
+///
+/// Windows の「拡張キー」とは意味が逆で、フラグ付きの 0x25 は NumLock オフ時のテンキーの 4、
+/// フラグのない 0x25 はナビゲーションクラスタの ← を表す。
+pub const NUMPAD_ORIGIN_FLAG: u32 = 0x8000_0000;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,11 +81,11 @@ impl KeyCode {
     }
 
     pub fn vk(self) -> u32 {
-        self.0 & !EXTENDED_FLAG
+        self.0 & !NUMPAD_ORIGIN_FLAG
     }
 
-    pub fn is_extended(self) -> bool {
-        self.0 & EXTENDED_FLAG != 0
+    pub fn is_numpad_origin(self) -> bool {
+        self.0 & NUMPAD_ORIGIN_FLAG != 0
     }
 }
 
@@ -108,14 +111,14 @@ mod tests {
     const SAMPLE: &str = r#"{"remapKeys":{"inProcess":[{"originalKeys":"2147483685","newRemapKeys":"100"},{"originalKeys":"12","newRemapKeys":"101"}]},"remapKeysToText":{"inProcess":[]},"remapShortcuts":{"global":[],"appSpecific":[]},"remapShortcutsToText":{"global":[],"appSpecific":[]}}"#;
 
     #[test]
-    fn parses_extended_keys() {
+    fn parses_numpad_origin_keys() {
         let cfg: Config = serde_json::from_str(SAMPLE).unwrap();
         let keys = &cfg.remap_keys.in_process;
         assert_eq!(keys.len(), 2);
         let k = keys[0].original()[0];
-        assert!(k.is_extended());
+        assert!(k.is_numpad_origin());
         assert_eq!(k.vk(), 0x25);
-        assert!(!keys[1].original()[0].is_extended());
+        assert!(!keys[1].original()[0].is_numpad_origin());
     }
 
     #[test]
