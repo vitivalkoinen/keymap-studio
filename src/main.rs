@@ -3,6 +3,7 @@
 mod app_settings;
 mod applog;
 mod autostart;
+mod cloak;
 mod config;
 mod edit;
 mod hotkey;
@@ -101,6 +102,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             app.start_resident(&cc.egui_ctx, activation);
+            // ウィンドウはできているが、まだ何も描いていない。ここでクロークしておく
+            app.cloak_if_starting_hidden(cloak::hwnd_of(cc));
             Ok(Box::new(app))
         }),
     )
@@ -791,6 +794,8 @@ struct App {
     quitting: bool,
     /// トレイだけで起動したので、最初に描くフレームでウィンドウを隠す
     start_hidden: bool,
+    /// トレイだけで起動したときに、ウィンドウを一瞬も見せないための DWM のクローク(§4.5)
+    cloak: cloak::Cloak,
 }
 
 impl App {
@@ -841,6 +846,7 @@ impl App {
             hotkey_failures: Vec::new(),
             quitting: false,
             start_hidden: false,
+            cloak: cloak::Cloak::default(),
         };
         app.refresh_keymaps();
         app
@@ -1439,15 +1445,37 @@ impl App {
             self.hotkey_dialog = None;
         } else if self.is_dirty() && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            App::show_window(ctx);
+            self.show_window(ctx);
             self.dialog = Some(Dialog::CloseWithUnsaved);
             self.keymap_dialog = None;
             self.hotkey_dialog = None;
         }
     }
 
+    /// トレイだけで起動するとき、最初の表示より前にウィンドウをクロークする(§4.5)。
+    /// eframe は最初のフレームのあとに必ずウィンドウを表示するので、そのまま隠すと一瞬見える。
+    /// クロークできなければ、今までどおり(一瞬見えることがある)動く。
+    fn cloak_if_starting_hidden(&mut self, hwnd: Option<usize>) {
+        if !cloak::should_cloak_at_start(self.start_hidden, self.resident.is_some()) {
+            return;
+        }
+        self.cloak = cloak::Cloak::new(hwnd);
+        match self.cloak.cloak() {
+            Ok(()) => self.log.write("window: cloaked until opened"),
+            Err(e) => self.log.write(&format!("window: failed to cloak: {e}")),
+        }
+    }
+
     /// ウィンドウを出して前面に持ってくる。
-    fn show_window(ctx: &egui::Context) {
+    ///
+    /// クロークしていれば、`Visible(true)` を送る前(ウィンドウが隠れている間)に外す。
+    /// 最初のフレームより前に開くことになったとき(起動直後に二重起動の知らせが届いたなど)は、
+    /// 最初のフレームで隠すのもやめる。
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.start_hidden = false;
+        if let Err(e) = self.cloak.uncloak() {
+            self.log.write(&format!("window: failed to uncloak: {e}"));
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -1463,7 +1491,7 @@ impl App {
         }
         for event in events {
             match event {
-                tray::Event::OpenWindow => App::show_window(ctx),
+                tray::Event::OpenWindow => self.show_window(ctx),
                 tray::Event::Quit => {
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -4238,6 +4266,52 @@ mod tests {
         assert_eq!(
             taken(Target::Keymap("gone.json".into())),
             "Already assigned to: gone.json"
+        );
+    }
+
+    #[test]
+    fn opening_the_window_removes_the_cloak() {
+        let env = Env::new();
+        env.install();
+        let mut app = env.app(None);
+        // トレイが使えない(このテストでは常駐しない)ときはクロークしない
+        app.start_hidden = true;
+        app.cloak_if_starting_hidden(None);
+        assert!(!app.cloak.is_cloaked());
+
+        // クロークして隠している状態から開く: クロークを外し、最初のフレームで隠すのもやめる。
+        // クロークを外すのは show_window の中で同期的に行い、Visible(true) は送るだけで
+        // eframe が後で処理するので、外すのが表示より先になることは構造上保証される
+        app.cloak = cloak::Cloak::cloaked_for_test();
+        let ctx = egui::Context::default();
+        app.show_window(&ctx);
+        assert!(!app.cloak.is_cloaked());
+        assert!(!app.start_hidden);
+
+        // 「終了」で未保存の確認を出すときも、ウィンドウを開くのでクロークを外す
+        app.cloak = cloak::Cloak::cloaked_for_test();
+        edit_a_to_c(&mut app);
+        app.quitting = true;
+        app.on_close_requested(&ctx, true);
+        assert_eq!(app.dialog, Some(Dialog::CloseWithUnsaved));
+        assert!(!app.cloak.is_cloaked());
+
+        // × で隠すときはクロークに触らない(すでに外れていれば外れたまま)
+        app.quitting = false;
+        app.dialog = None;
+        app.on_close_requested(&ctx, true);
+        assert!(!app.cloak.is_cloaked());
+
+        // 外すのに失敗したら、クロークしたまま残し(ログに残す)、次に開くときにもう一度試す
+        app.cloak = cloak::Cloak::unremovable_for_test();
+        app.show_window(&ctx);
+        assert!(app.cloak.is_cloaked());
+        assert!(env.log_text().contains("window: failed to uncloak"));
+        app.show_window(&ctx);
+        assert!(app.cloak.is_cloaked());
+        assert_eq!(
+            env.log_text().matches("window: failed to uncloak").count(),
+            2
         );
     }
 

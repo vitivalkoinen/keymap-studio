@@ -1692,6 +1692,7 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "eframe",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",
