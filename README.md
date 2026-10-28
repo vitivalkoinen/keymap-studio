@@ -4,7 +4,7 @@ English | [日本語](README.ja.md)
 
 A visual editor for [PowerToys Keyboard Manager](https://learn.microsoft.com/windows/powertoys/keyboard-manager) key remaps on Windows 11. You edit remaps on a picture of the keyboard and switch between whole keymaps with a hotkey.
 
-<!-- ![Keymap Studio](docs/images/main.png) -->
+![Keymap Studio](docs/images/main.png)
 
 ## Features
 

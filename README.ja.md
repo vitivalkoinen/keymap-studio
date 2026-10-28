@@ -4,7 +4,7 @@
 
 Windows 11 の [PowerToys Keyboard Manager](https://learn.microsoft.com/ja-jp/windows/powertoys/keyboard-manager) のキーリマップを、キーボードの図の上で視覚的に編集できるアプリです。リマップのセットを丸ごと、ホットキーで切り替えることもできます。
 
-<!-- ![Keymap Studio](docs/images/main.png) -->
+![Keymap Studio](docs/images/main.png)
 
 > アプリの画面は現在英語のみです(日本語化を予定しています)。以下ではボタン名を英語のまま書いています。
 
