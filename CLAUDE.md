@@ -23,7 +23,7 @@ PowerToys Keyboard Manager のキーリマップを視覚的に編集する Wind
 ## 開発環境
 
 - WSL2 上で開発し、成果物の対象は Windows
-- PowerToys の実際の設定ファイル: `/mnt/c/Users/snow7/AppData/Local/Microsoft/PowerToys/Keyboard Manager/`
+- PowerToys の実際の設定ファイル: `/mnt/c/Users/<Windows のユーザー名>/AppData/Local/Microsoft/PowerToys/Keyboard Manager/`
   - **読むのは自由。書き込むときは事前にユーザーの許可を得る**(ユーザーが実際に使っている設定のため)。テストではリポジトリ内のフィクスチャか一時ディレクトリを使う
 - シェルの `cd` は zoxide に置き換えられているため、`builtin cd` を使うか絶対パスで操作する
 
@@ -35,7 +35,7 @@ cargo test
 cargo clippy -- -D warnings
 cargo fmt --check
 # WSLg での起動(GPU を使った EGL の初期化に失敗するためソフトウェア描画を指定する)
-LIBGL_ALWAYS_SOFTWARE=1 cargo run -- "/mnt/c/Users/snow7/AppData/Local/Microsoft/PowerToys/Keyboard Manager/default.json"
+LIBGL_ALWAYS_SOFTWARE=1 cargo run -- "/mnt/c/Users/<Windows のユーザー名>/AppData/Local/Microsoft/PowerToys/Keyboard Manager/default.json"
 ```
 
 変更を完了とする条件: `cargo test`・`cargo clippy -- -D warnings`・`cargo fmt --check` がすべて通ること。
